@@ -1,0 +1,172 @@
+# aot-headless-client
+
+A standalone, **headless** Python client for **Age of Time** (AoT) that
+**reimplements the Torque Game Engine network protocol from scratch** — no game
+engine, no rendering, no GUI. It performs the full UDP handshake, completes the
+mission load, logs in, and then stays in-world as a lightweight client. From
+there it can:
+
+- relay chat (global + local/proximity) and server messages,
+- send arbitrary `commandToServer(...)` verbs,
+- track the live online-player roster and scoped game objects (positions,
+  rotations, shape names, datablocks),
+- bridge all of the above to **Node-RED** over TCP,
+- be driven interactively from a terminal REPL.
+
+The import package is **`aotbot`** (so you run `python -m aotbot.main`); the
+project/repo is named `aot-headless-client`.
+
+> **What it is:** an unofficial, fan-made protocol client built by reverse-
+> engineering the game's networking. It is not affiliated with or endorsed by
+> the Age of Time developers. Use your own account, play nice with the server
+> (the live-test tooling uses single, polite sessions with clean disconnects),
+> and don't do anything you wouldn't do in the normal client.
+
+For the full wire format, command verbs, and protocol flow, see
+**[SPEC.md](./SPEC.md)** and the deep-dive notes under [`docs/`](./docs/).
+
+## Requirements
+
+- Python **>= 3.11**
+- Runtime deps: `python-dotenv`, `prompt_toolkit`
+
+## Setup
+
+```bash
+git clone <this-repo> aot-headless-client
+cd aot-headless-client
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+# install the package (editable) + dev tools (pytest)
+pip install -e ".[dev]"
+# or runtime deps only:
+# pip install -r requirements.txt
+```
+
+Then create your `.env` from the template and fill it in:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+```
+
+The real `.env` is **gitignored** — only `.env.example` is committed. Every
+variable is documented in `.env.example`. At minimum set `AOT_SERVER_HOST`,
+`AOT_SERVER_PORT`, `AOT_USERNAME`, and `AOT_PASSWORD`. The password is never
+sent in clear: login sends `commandToServer('login', user, getStringCRC(pass))`.
+
+## Configuration
+
+Loaded from environment variables, seeded from `.env` (shell env wins over
+`.env`). See `.env.example` for the full annotated list. Highlights:
+
+| Variable             | Required | Default     | Purpose                                                   |
+| -------------------- | -------- | ----------- | --------------------------------------------------------- |
+| `AOT_SERVER_HOST`    | yes      | —           | AoT server host/IP                                        |
+| `AOT_SERVER_PORT`    | yes      | `28000`     | AoT server UDP port                                       |
+| `AOT_USERNAME`       | yes      | —           | Account username                                          |
+| `AOT_PASSWORD`       | yes      | —           | Account password (sent as a CRC, never in clear)          |
+| `AOT_CREATE_USER`    | no       | `false`     | Auto-create the character if it doesn't exist             |
+| `AOT_TRACK_OBJECTS`  | no       | `false`     | Decode the ghost stream into a live object/player registry|
+| `NODERED_HOST`       | no       | `localhost` | Node-RED TCP bridge host                                  |
+| `NODERED_PORT`       | no       | `1881`      | Node-RED TCP bridge port                                  |
+| `LOG_LEVEL`          | no       | `info`      | debug / info / warning / error / critical                 |
+| `DUMP_PACKETS`       | no       | `false`     | Hexdump + bit-decode UDP traffic (handshake debugging)    |
+| `AOT_SKIP_LIGHTING`  | no       | `true`      | Ack mission phases 2/3 immediately to skip lighting load  |
+
+Object/player **positions** require `AOT_TRACK_OBJECTS=true`. With it off the
+ghost stream is still decoded for alignment, but no registry is kept (lower CPU);
+chat, login, and the player roster (names/regions) still work.
+
+## Running
+
+```bash
+# console script (installed by `pip install -e .`)
+aotbot
+
+# or as a module
+python -m aotbot.main
+
+# point at a specific env file / override values
+aotbot --env-file ./prod.env --host 10.0.0.5 --port 28000 --dump-packets
+```
+
+When stdin is a TTY the interactive REPL starts automatically (disable with
+`--no-interactive`). The bot connects, loads in, logs in, and bridges to
+Node-RED for as long as it runs; Ctrl-C / `/quit` disconnects cleanly.
+
+## Interactive REPL
+
+Type-ahead, Tab-completion of commands (and `/cts` verbs), and fish-style inline
+suggestions are provided by `prompt_toolkit`; incoming log lines render cleanly
+above the prompt.
+
+| Command                      | Description                                            |
+| ---------------------------- | ------------------------------------------------------ |
+| `/help`                      | List commands.                                         |
+| `/say <msg>`                 | Global chat (`commandToServer MessageSent`).           |
+| `/lsay <msg>`                | Local/proximity chat (`commandToServer Talk`).         |
+| `/cts <verb> [args...]`      | Arbitrary `commandToServer` (aliases `/commandtoserver`, `/raw`). Quote args with spaces. |
+| `/players` (`/who`, `/pl`)   | Online players: name, region, position, object id, join time. |
+| `/objects [all] [class]`     | Scoped objects (needs `AOT_TRACK_OBJECTS`).            |
+| `/object <ghostId>`          | One object's full attributes.                          |
+| `/login [user] [pass]`       | Log in (defaults to the configured account).           |
+| `/logout` / `/register`      | Log out / register a new character.                    |
+| `/status` / `/quit`          | Connection state / disconnect and exit.                |
+
+## Node-RED bridge
+
+The bot connects as a TCP client to Node-RED. **Outbound** messages (bot →
+Node-RED) are JSON objects with an `action` field, mirroring the in-game Torque
+bot's protocol; **inbound** messages (Node-RED → bot) are line-based commands.
+See [`docs/nodered-protocol.md`](./docs/nodered-protocol.md) for the full schema.
+
+Outbound actions include `player_message`, `server_message`, `login_result`,
+`connection_state`, `object_list`, `players`, and `object`. Inbound commands
+include `say`, `global`, `login`, `logout`, `register`, `raw` (commandToServer),
+`list_objects`, `players`, `get_object`, and `disconnect`.
+
+Example — request the online-player roster by sending `{"action":"players"}`;
+the bot replies with each player's `location` (world region, e.g. "Port Town"),
+`joined_at` (unix timestamp), and — when `AOT_TRACK_OBJECTS` is on — the matched
+`object_id`, `position`, and full `object`.
+
+## Project layout
+
+```
+aotbot/
+  bitstream.py          # bit-packed BitStream reader/writer
+  transport.py          # async UDP socket
+  crc.py                # getStringCRC (zlib.crc32, finalized)
+  protocol_constants.py # constants confirmed against the game binary
+  netconn.py            # connection handshake + packet/notify/ack layer
+  events.py             # RemoteCommandEvent / NetStringEvent + string tables
+  datablocks.py         # per-class SimDataBlock unpackData decoders
+  ghosts.py             # per-class NetObject unpackUpdate decoders
+  phases.py             # GameConnection body + mission phases + ghost section
+  telemetry.py          # scoped-object registry + decode-time value sink
+  playerlist.py         # online-player roster + roster<->object matching
+  client.py             # high-level connect/login/chat/query API
+  nodered.py            # Node-RED TCP bridge
+  repl.py               # interactive terminal REPL
+  config.py             # .env -> Config; logging_setup.py; main.py (entrypoint)
+docs/                   # protocol deep-dives (handshake, events, phases, CRC, ...)
+tools/                  # capture/replay + reverse-engineering utilities
+tests/                  # unit + capture-replay regression tests
+```
+
+## Tests
+
+```bash
+python -m pytest            # full suite
+python -m pytest tests/test_phases.py
+```
+
+Some tests replay recorded session captures from `tools/captures/` as regression
+guards; they skip automatically if a capture file is absent.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).

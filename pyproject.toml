@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aot-headless-client"
+version = "0.1.0"
+description = "Headless Python client that reimplements the Age of Time (Torque) network protocol and bridges it to Node-RED. Import package: aotbot."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Skylar Sadlier" }]
+license = { text = "MIT" }
+dependencies = [
+    "python-dotenv>=1.0", "prompt_toolkit>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+]
+
+[project.scripts]
+aotbot = "aotbot.main:main"
+
+[tool.setuptools.packages.find]
+include = ["aotbot*"]
+
+[tool.pytest.ini_options]
+# Keep rootdir/test discovery here so tests/ needs no __init__.py.
+testpaths = ["tests"]
+addopts = "-ra"

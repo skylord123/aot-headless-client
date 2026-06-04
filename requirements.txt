@@ -1,0 +1,4 @@
+# Runtime dependencies (mirror of pyproject.toml [project].dependencies).
+# Dev-only deps (pytest) live in pyproject.toml under [project.optional-dependencies].dev.
+python-dotenv>=1.0
+prompt_toolkit>=3.0
