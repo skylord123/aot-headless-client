@@ -53,9 +53,10 @@ $EDITOR .env
 ```
 
 The real `.env` is **gitignored** — only `.env.example` is committed. Every
-variable is documented in `.env.example`. At minimum set `AOT_SERVER_HOST`,
-`AOT_SERVER_PORT`, `AOT_USERNAME`, and `AOT_PASSWORD`. The password is never
-sent in clear: login sends `commandToServer('login', user, getStringCRC(pass))`.
+variable is documented in `.env.example`. At minimum set `AOT_USERNAME` and
+`AOT_PASSWORD`; the server host is optional (blank ⇒ resolved from the master
+server) and the port defaults to `28000`. The password is never sent in clear:
+login sends `commandToServer('login', user, getStringCRC(pass))`.
 
 ## Configuration
 
@@ -64,8 +65,9 @@ Loaded from environment variables, seeded from `.env` (shell env wins over
 
 | Variable             | Required | Default     | Purpose                                                   |
 | -------------------- | -------- | ----------- | --------------------------------------------------------- |
-| `AOT_SERVER_HOST`    | yes      | —           | AoT server host/IP                                        |
-| `AOT_SERVER_PORT`    | yes      | `28000`     | AoT server UDP port                                       |
+| `AOT_SERVER_HOST`    | no       | (resolved)  | AoT server host/IP. Blank ⇒ resolve from the master server |
+| `AOT_SERVER_PORT`    | no       | `28000`     | AoT server UDP port                                       |
+| `AOT_MASTER_URL`     | no       | official    | Master server list, parsed for `IP <addr>` when host blank |
 | `AOT_USERNAME`       | yes      | —           | Account username                                          |
 | `AOT_PASSWORD`       | yes      | —           | Account password (sent as a CRC, never in clear)          |
 | `AOT_CREATE_USER`    | no       | `false`     | Auto-create the character if it doesn't exist             |

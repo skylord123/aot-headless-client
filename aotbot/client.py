@@ -31,6 +31,7 @@ from . import protocol_constants as pc
 from .config import Config
 from .crc import get_string_crc
 from .events import EventManager, RemoteCommandEvent
+from .masterserver import MasterServerError, fetch_server_host
 from .netconn import ConnState, NetConnection
 from .phases import GameConnectionPhases, AlignmentError
 from .playerlist import PlayerListRegistry, match_player_objects
@@ -140,6 +141,9 @@ class AotClient:
             track_objects=config.aot_track_objects,
         )
         self.conn: Optional[NetConnection] = None
+        # Host resolved from the master server (when AOT_SERVER_HOST is empty),
+        # cached so reconnects don't re-fetch.
+        self._resolved_host: Optional[str] = None
 
         # Online-player roster (fed by MsgClientJoin/Drop/ScoreChanged).
         self.players = PlayerListRegistry()
@@ -199,8 +203,14 @@ class AotClient:
         # Fresh session: drop any stale roster from a previous connection (the
         # server re-sends MsgClientJoin for everyone online as we load in).
         self.players.clear()
+        # Resolve the server host from the master server if none was configured.
+        try:
+            host = await self._resolve_server_host()
+        except MasterServerError as exc:
+            logger.error("%s", exc)
+            return False
         await self.transport.open(local_addr=("0.0.0.0", 0))
-        server = (self.config.aot_server_host, self.config.aot_server_port)
+        server = (host, self.config.aot_server_port)
         # The genuine client sends setConnectArgs($version, $pref::Player::Name).
         # CAPTURE-CONFIRMED: arg1 is the PRE-LOGIN DISPLAY NAME ($pref::Player::Name
         # default "Fresh Meat"), NOT the account username -- the account is
@@ -227,6 +237,21 @@ class AotClient:
         # cost) unless we have queued events to deliver.
         self.conn.has_pending_data = self.events.has_pending_events
         return await self.conn.connect(timeout=timeout)
+
+    async def _resolve_server_host(self) -> str:
+        """Return the configured server host, or resolve it from the master
+        server list when ``AOT_SERVER_HOST`` is empty. Raises MasterServerError
+        on failure. The resolved host is cached for subsequent reconnects."""
+        if self.config.aot_server_host:
+            return self.config.aot_server_host
+        if self._resolved_host:
+            return self._resolved_host
+        loop = asyncio.get_running_loop()
+        host = await loop.run_in_executor(
+            None, lambda: fetch_server_host(self.config.aot_master_url)
+        )
+        self._resolved_host = host
+        return host
 
     def _write_body(self, bs) -> None:
         # The send-seq the body rides in is the connection's just-incremented

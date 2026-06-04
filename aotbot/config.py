@@ -19,6 +19,8 @@ try:
 except ImportError:  # pragma: no cover - dependency is declared, but be friendly.
     load_dotenv = None  # type: ignore[assignment]
 
+from .masterserver import DEFAULT_MASTER_URL
+
 
 __all__ = ["Config", "ConfigError"]
 
@@ -61,13 +63,19 @@ class Config:
     a modified copy.
     """
 
-    # Age of Time game server (required).
+    # Age of Time game server. The host is OPTIONAL: when empty, the bot resolves
+    # it from the master server list (see ``aot_master_url``) at connect time.
+    # The port is not advertised there, so it defaults to 28000.
     aot_server_host: str
     aot_server_port: int
 
     # Bot account credentials (required).
     aot_username: str
     aot_password: str
+
+    # Master server list URL used to resolve the host when ``aot_server_host`` is
+    # empty (parses the "IP <addr>" line; see aotbot.masterserver).
+    aot_master_url: str = DEFAULT_MASTER_URL
 
     # Node-RED TCP bridge.
     nodered_host: str = "localhost"
@@ -135,11 +143,16 @@ class Config:
                 load_dotenv(dotenv_path=dotenv_path, override=False)
             env = os.environ
 
-        host = _require(env, "AOT_SERVER_HOST")
+        # Host is optional: empty => resolve from the master server at connect.
+        host = env.get("AOT_SERVER_HOST", "").strip()
         username = _require(env, "AOT_USERNAME")
         password = _require(env, "AOT_PASSWORD")
 
-        port = _to_int(_require(env, "AOT_SERVER_PORT"), var="AOT_SERVER_PORT")
+        # Port is not advertised by the master server, so it defaults to 28000.
+        port = _to_int(env.get("AOT_SERVER_PORT", "28000"), var="AOT_SERVER_PORT")
+        master_url = (
+            env.get("AOT_MASTER_URL", DEFAULT_MASTER_URL).strip() or DEFAULT_MASTER_URL
+        )
 
         nodered_host = env.get("NODERED_HOST", "localhost").strip() or "localhost"
         nodered_port = _to_int(
@@ -171,6 +184,7 @@ class Config:
             aot_server_port=port,
             aot_username=username,
             aot_password=password,
+            aot_master_url=master_url,
             nodered_host=nodered_host,
             nodered_port=nodered_port,
             aot_create_user=create_user,

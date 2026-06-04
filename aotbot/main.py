@@ -196,7 +196,8 @@ async def _main(config: Config, interactive: bool = False) -> None:
 
     await bridge.start()
 
-    log.info("connecting to AoT server %s:%d", config.aot_server_host, config.aot_server_port)
+    target = config.aot_server_host or f"(resolve via master server {config.aot_master_url})"
+    log.info("connecting to AoT server %s port %d", target, config.aot_server_port)
     ok = await client.connect()
     if not ok:
         log.error("connection failed; shutting down")

@@ -15,6 +15,13 @@ REQUIRED = {
     "AOT_PASSWORD": "s3cret",
 }
 
+# The only TRULY required vars. Host is optional (resolved from the master
+# server when empty) and the port defaults to 28000.
+CREDS_ONLY = {
+    "AOT_USERNAME": "botuser",
+    "AOT_PASSWORD": "s3cret",
+}
+
 
 def _set_env(monkeypatch, **values):
     """Clear all aotbot vars, then set the provided ones."""
@@ -95,7 +102,7 @@ def test_values_are_stripped():
 # --- Required-var validation ---------------------------------------------
 
 
-@pytest.mark.parametrize("missing", list(REQUIRED))
+@pytest.mark.parametrize("missing", list(CREDS_ONLY))
 def test_missing_required_raises(missing):
     env = {k: v for k, v in REQUIRED.items() if k != missing}
     with pytest.raises(ConfigError) as exc:
@@ -103,11 +110,32 @@ def test_missing_required_raises(missing):
     assert missing in str(exc.value)
 
 
-@pytest.mark.parametrize("var", list(REQUIRED))
+@pytest.mark.parametrize("var", list(CREDS_ONLY))
 def test_empty_required_raises(var):
     env = {**REQUIRED, var: "   "}
     with pytest.raises(ConfigError):
         _load_from(env)
+
+
+# --- Optional host / master-server resolution -----------------------------
+
+
+def test_server_host_optional_defaults_empty():
+    # Host omitted -> empty (resolved from the master server at connect time),
+    # and the port falls back to 28000.
+    env = {k: v for k, v in REQUIRED.items()
+           if k not in ("AOT_SERVER_HOST", "AOT_SERVER_PORT")}
+    cfg = _load_from(env)
+    assert cfg.aot_server_host == ""
+    assert cfg.aot_server_port == 28000
+
+
+def test_master_url_default_and_override():
+    from aotbot.masterserver import DEFAULT_MASTER_URL
+
+    assert _load_from(REQUIRED).aot_master_url == DEFAULT_MASTER_URL
+    cfg = _load_from({**REQUIRED, "AOT_MASTER_URL": "https://example.com/s.txt"})
+    assert cfg.aot_master_url == "https://example.com/s.txt"
 
 
 # --- Type / range validation ---------------------------------------------
