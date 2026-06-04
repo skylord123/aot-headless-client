@@ -105,7 +105,7 @@ is baked in (and `.env*` is excluded via `.dockerignore`).
 Pull the published image from GitHub Container Registry:
 
 ```bash
-docker pull ghcr.io/<owner>/aot-headless-client:latest
+docker pull ghcr.io/skylord123/aot-headless-bot:latest
 ```
 
 Run it (pass config with `-e` flags, or reuse your local `.env` with
@@ -116,10 +116,10 @@ docker run --rm --init \
   -e AOT_SERVER_HOST=1.2.3.4 -e AOT_SERVER_PORT=28000 \
   -e AOT_USERNAME='Your Account' -e AOT_PASSWORD='your-password' \
   -e AOT_TRACK_OBJECTS=true \
-  ghcr.io/<owner>/aot-headless-client:latest
+  ghcr.io/skylord123/aot-headless-bot:latest
 
 # or, locally, reuse .env (passed as env vars, not read from inside the image):
-docker run --rm --init --env-file .env ghcr.io/<owner>/aot-headless-client:latest
+docker run --rm --init --env-file .env ghcr.io/skylord123/aot-headless-bot:latest
 ```
 
 Build it locally for testing:
