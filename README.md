@@ -97,6 +97,45 @@ When stdin is a TTY the interactive REPL starts automatically (disable with
 `--no-interactive`). The bot connects, loads in, logs in, and bridges to
 Node-RED for as long as it runs; Ctrl-C / `/quit` disconnects cleanly.
 
+## Docker
+
+The image reads **all** configuration from the container environment — no `.env`
+is baked in (and `.env*` is excluded via `.dockerignore`).
+
+Pull the published image from GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/<owner>/aot-headless-client:latest
+```
+
+Run it (pass config with `-e` flags, or reuse your local `.env` with
+`--env-file`, which injects the values as container env vars):
+
+```bash
+docker run --rm --init \
+  -e AOT_SERVER_HOST=1.2.3.4 -e AOT_SERVER_PORT=28000 \
+  -e AOT_USERNAME='Your Account' -e AOT_PASSWORD='your-password' \
+  -e AOT_TRACK_OBJECTS=true \
+  ghcr.io/<owner>/aot-headless-client:latest
+
+# or, locally, reuse .env (passed as env vars, not read from inside the image):
+docker run --rm --init --env-file .env ghcr.io/<owner>/aot-headless-client:latest
+```
+
+Build it locally for testing:
+
+```bash
+docker build -t aot-headless-client .
+docker run --rm --env-file .env aot-headless-client
+```
+
+The bot runs headless and as a non-root user; it installs SIGINT/SIGTERM
+handlers for a clean disconnect (`--init` adds a PID-1 signal reaper).
+
+CI builds the image on every push/PR (without publishing); pushes to the default
+branch and `v*` tags publish to GHCR via the
+[`docker-publish`](./.github/workflows/docker-publish.yml) workflow.
+
 ## Interactive REPL
 
 Type-ahead, Tab-completion of commands (and `/cts` verbs), and fish-style inline

@@ -1,0 +1,29 @@
+# Keep the build context small and ensure secrets never enter an image layer.
+.git
+.github
+.venv
+venv
+env
+
+# Secrets / local config — never ship these.
+.env
+.env.*
+!.env.example
+
+# Caches / build artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Not needed at runtime (the Dockerfile copies only the package + metadata).
+tools/captures/
+*.jsonl
+*.pcap
+*.log
