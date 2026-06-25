@@ -10,7 +10,8 @@ there it can:
 - send arbitrary `commandToServer(...)` verbs,
 - track the live online-player roster and scoped game objects (positions,
   rotations, shape names, datablocks),
-- bridge all of the above to **Node-RED** over TCP,
+- bridge all of the above to **Node-RED** over TCP and/or host a **WebSocket
+  server** that clients connect to, both speaking JSON with an `action` field,
 - be driven interactively from a terminal REPL.
 
 The import package is **`aotbot`** (so you run `python -m aotbot.main`); the
@@ -72,8 +73,10 @@ Loaded from environment variables, seeded from `.env` (shell env wins over
 | `AOT_PASSWORD`       | yes      | —           | Account password (sent as a CRC, never in clear)          |
 | `AOT_CREATE_USER`    | no       | `false`     | Auto-create the character if it doesn't exist             |
 | `AOT_TRACK_OBJECTS`  | no       | `false`     | Decode the ghost stream into a live object/player registry|
-| `NODERED_HOST`       | no       | `localhost` | Node-RED TCP bridge host                                  |
-| `NODERED_PORT`       | no       | `1881`      | Node-RED TCP bridge port                                  |
+| `NODERED_HOST`       | no       | _(unset)_   | Node-RED TCP bridge host (both host+port required to enable) |
+| `NODERED_PORT`       | no       | _(unset)_   | Node-RED TCP bridge port (both host+port required to enable) |
+| `WEBSOCKET_PORT`     | no       | _(unset)_   | Host a WebSocket server on this port (unset → not started)  |
+| `WEBSOCKET_HOST`     | no       | `0.0.0.0`   | Interface the WebSocket server binds (`127.0.0.1` = local)  |
 | `LOG_LEVEL`          | no       | `info`      | debug / info / warning / error / critical                 |
 | `DUMP_PACKETS`       | no       | `false`     | Hexdump + bit-decode UDP traffic (handshake debugging)    |
 | `AOT_SKIP_LIGHTING`  | no       | `true`      | Ack mission phases 2/3 immediately to skip lighting load  |
@@ -97,7 +100,8 @@ aotbot --env-file ./prod.env --host 10.0.0.5 --port 28000 --dump-packets
 
 When stdin is a TTY the interactive REPL starts automatically (disable with
 `--no-interactive`). The bot connects, loads in, logs in, and bridges to
-Node-RED for as long as it runs; Ctrl-C / `/quit` disconnects cleanly.
+Node-RED and/or the WebSocket server (whichever are configured) for as long as
+it runs; Ctrl-C / `/quit` disconnects cleanly.
 
 ## Docker
 
@@ -157,22 +161,33 @@ above the prompt.
 | `/logout` / `/register`      | Log out / register a new character.                    |
 | `/status` / `/quit`          | Connection state / disconnect and exit.                |
 
-## Node-RED bridge
+## Bridges (Node-RED & WebSocket)
 
-The bot connects as a TCP client to Node-RED. **Outbound** messages (bot →
-Node-RED) are JSON objects with an `action` field, mirroring the in-game Torque
-bot's protocol; **inbound** messages (Node-RED → bot) are line-based commands.
-See [`docs/nodered-protocol.md`](./docs/nodered-protocol.md) for the full schema.
+The bot can expose itself two ways, **independently** — enable either, both, or
+neither:
 
-Outbound actions include `player_message`, `server_message`, `login_result`,
-`connection_state`, `object_list`, `players`, and `object`. Inbound commands
-include `say`, `global`, `login`, `logout`, `register`, `raw` (commandToServer),
-`list_objects`, `players`, `get_object`, and `disconnect`.
+- **Node-RED (TCP client).** Set **both** `NODERED_HOST` and `NODERED_PORT`; the
+  bot dials out to Node-RED. **Inbound** (Node-RED → bot) messages are line-based
+  text commands; **outbound** (bot → Node-RED) are JSON objects with an `action`
+  field. Full schema: [`docs/nodered-protocol.md`](./docs/nodered-protocol.md).
+- **WebSocket (server).** Set `WEBSOCKET_PORT`; the bot *hosts* a WebSocket
+  server that clients (Node-RED, a browser, a script) connect to. Messages are
+  JSON objects in **both** directions, e.g. `{"action": "say", "message": "hi"}`.
+  Full schema: [`docs/websocket-protocol.md`](./docs/websocket-protocol.md).
 
-Example — request the online-player roster by sending `{"action":"players"}`;
-the bot replies with each player's `location` (world region, e.g. "Port Town"),
-`joined_at` (unix timestamp), and — when `AOT_TRACK_OBJECTS` is on — the matched
-`object_id`, `position`, and full `object`.
+Both transports share the same `action` vocabulary, so a flow built for one maps
+onto the other. Outbound actions include `player_message`, `server_message`
+(only chat-HUD lines — empty control-message spam is suppressed), `player_joined`,
+`player_dropped`, `zone_change`, `login_result`, `connection_state`,
+`object_list`, `players`, and `object`.
+Inbound actions include `say`, `global`, `login`, `logout`, `register`, `raw`
+(commandToServer), `list_objects`, `players`, `get_object`, and `disconnect`.
+
+Example — request the online-player roster (send `players` to Node-RED, or
+`{"action":"players"}` over WebSocket); the bot replies with each player's
+`location` (world region, e.g. "Port Town"), `joined_at` (unix timestamp), and —
+when `AOT_TRACK_OBJECTS` is on — the matched `object_id`, `position`, and full
+`object`.
 
 ## Project layout
 
@@ -190,7 +205,8 @@ aotbot/
   telemetry.py          # scoped-object registry + decode-time value sink
   playerlist.py         # online-player roster + roster<->object matching
   client.py             # high-level connect/login/chat/query API
-  nodered.py            # Node-RED TCP bridge
+  nodered.py            # Node-RED TCP bridge (client)
+  websocket.py          # WebSocket server bridge (RFC 6455, stdlib)
   repl.py               # interactive terminal REPL
   config.py             # .env -> Config; logging_setup.py; main.py (entrypoint)
 docs/                   # protocol deep-dives (handshake, events, phases, CRC, ...)

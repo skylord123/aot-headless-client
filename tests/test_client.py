@@ -80,12 +80,128 @@ def test_chat_message_dispatch_emits_on_chat():
     assert got == [("local", "Eve", "hi")]
 
 
+def test_chat_message_substitutes_global_template_args():
+    # Real server layout: clientCmdChatMessage(sender, voice, pitch, template,
+    # %a1, %a2). The template "%1: %2" must be filled from the trailing args
+    # BEFORE parsing (regression: previously name/message came through as %1/%2).
+    client = AotClient(_cfg())
+    got = []
+    client.on_chat = lambda scope, name, msg, raw: got.append((scope, name, msg))
+    _feed_command(client, "ChatMessage", "7", "0", "0", "%1: %2", "Bob", "hello there")
+    assert got == [("global", "Bob", "hello there")]
+
+
+def test_chat_message_substitutes_local_template_args():
+    client = AotClient(_cfg())
+    got = []
+    client.on_chat = lambda scope, name, msg, raw: got.append((scope, name, msg))
+    _feed_command(client, "ChatMessage", "7", "0", "0", '%1 says, "%2"', "Alice", "hi all")
+    assert got == [("local", "Alice", "hi all")]
+
+
 def test_server_message_dispatch_emits():
     client = AotClient(_cfg())
     got = []
     client.on_server_message = lambda t, text, extra: got.append((t, text))
     _feed_command(client, "ServerMessage", "0", "Welcome to AoT")
     assert got == [("0", "Welcome to AoT")]
+
+
+def test_empty_server_message_is_suppressed():
+    # Control messages with an empty msgString never reach the chat HUD
+    # (onServerMessage's getWordCount gate), so no server_message is emitted.
+    client = AotClient(_cfg())
+    got = []
+    client.on_server_message = lambda t, text, extra: got.append((t, text))
+    # MsgClientScoreChanged carries no human text.
+    _feed_command(client, "ServerMessage", "MsgClientScoreChanged", "", "\x04Port Town", "48708")
+    # MsgClientJoin with empty msgString (the common roster-sync case).
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "DiscordBot", "38239", "", "\x04Port Town", "0", "0", "0")
+    assert got == []
+
+
+def test_msg_client_join_emits_player_joined():
+    client = AotClient(_cfg())
+    joined = []
+    server_msgs = []
+    client.on_player_joined = lambda name, cid, loc, msg, users: joined.append((name, cid, loc, msg, users))
+    client.on_server_message = lambda t, text, extra: server_msgs.append(text)
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "DiscordBot", "38239", "", "\x04Port Town", "0", "0", "0")
+    assert joined == [("DiscordBot", 38239, "Port Town", "", ["DiscordBot"])]
+    assert server_msgs == []  # empty msgString -> no chat-HUD line
+
+
+def test_msg_client_join_with_text_emits_both():
+    client = AotClient(_cfg())
+    joined = []
+    server_msgs = []
+    client.on_player_joined = lambda name, cid, loc, msg, users: joined.append((name, msg, users))
+    client.on_server_message = lambda t, text, extra: server_msgs.append(text)
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "\x02A new player connected.", "<Connecting>", "48715", "", "", "0", "0", "0")
+    # Placeholder "<Connecting>" name is NOT recorded as a real username.
+    assert joined == [("<Connecting>", "A new player connected.", [])]
+    assert server_msgs == ["A new player connected."]  # non-empty -> also a HUD line
+
+
+def test_msg_client_drop_emits_player_dropped_with_name_and_message():
+    client = AotClient(_cfg())
+    dropped = []
+    server_msgs = []
+    client.on_player_dropped = lambda name, cid, msg, users: dropped.append((name, cid, msg, users))
+    client.on_server_message = lambda t, text, extra: server_msgs.append(text)
+    # Client joins first so the registry has the username history before the drop.
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "What's For Dinner", "39570", "", "\x04Shop", "0", "0", "0")
+    _feed_command(client, "ServerMessage", "MsgClientDrop", "\x02%1 has left the game.", "What's For Dinner", "39570")
+    assert dropped == [("What's For Dinner", 39570, "What's For Dinner has left the game.", ["What's For Dinner"])]
+    assert server_msgs == ["What's For Dinner has left the game."]
+
+
+def test_zone_change_emits_with_resolved_player_name():
+    client = AotClient(_cfg())
+    zones = []
+    server_msgs = []
+    client.on_zone_change = lambda player, zone, cid: zones.append((player, zone, cid))
+    client.on_server_message = lambda t, text, extra: server_msgs.append(text)
+    # Player must be in the roster for the name to resolve (like the in-game
+    # playerList_playerNameFromId lookup).
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "Alice", "51592", "", "\x04The Wilderness", "0", "0", "0")
+    _feed_command(client, "ServerMessage", "MsgClientScoreChanged", "", "\x04Port Town", "51592")
+    assert zones == [("Alice", "Port Town", 51592)]
+    assert server_msgs == []  # zone change carries no chat-HUD line
+
+
+def test_zone_change_skipped_for_unknown_or_placeholder_player():
+    client = AotClient(_cfg())
+    zones = []
+    client.on_zone_change = lambda player, zone, cid: zones.append((player, zone))
+    # Unknown client_id -> no name resolved -> no event.
+    _feed_command(client, "ServerMessage", "MsgClientScoreChanged", "", "\x04Port Town", "99999")
+    # Logged-out placeholder name -> skipped.
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "<Logged Out>", "12345", "", "", "0", "0", "0")
+    _feed_command(client, "ServerMessage", "MsgClientScoreChanged", "", "\x04Shop", "12345")
+    assert zones == []
+
+
+def test_associated_usernames_accumulate_across_relogin():
+    # Same connection (client_id) logs out and back in as different characters;
+    # all real names accumulate, placeholders are ignored, order is preserved.
+    client = AotClient(_cfg())
+    joined = []
+    client.on_player_joined = lambda name, cid, loc, msg, users: joined.append((name, list(users)))
+    cid = "48708"
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "Alice", cid, "", "\x04Port Town", "0", "0", "0")
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "<Logged Out>", cid, "", "", "0", "0", "0")
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "Bob", cid, "", "\x04Shop", "0", "0", "0")
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "Alice", cid, "", "\x04Shop", "0", "0", "0")  # dup
+    assert [u for _, u in joined] == [
+        ["Alice"],
+        ["Alice"],            # placeholder ignored, history unchanged
+        ["Alice", "Bob"],
+        ["Alice", "Bob"],     # duplicate not re-added
+    ]
+    # Exposed on the roster too.
+    roster = {p["client_id"]: p for p in client.get_players()}
+    assert roster[48708]["associated_usernames"] == ["Alice", "Bob"]
 
 
 def test_login_success_marks_logged_in():

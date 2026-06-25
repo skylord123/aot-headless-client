@@ -37,6 +37,22 @@ def test_join_drop_and_zone_change():
     assert [p.name for p in reg.list()] == ["Horse"]
 
 
+def test_associated_usernames_accumulate_and_skip_placeholders():
+    reg = PlayerListRegistry()
+    # One connection (client_id 5) cycles through characters and logout states.
+    reg.handle_server_message("MsgClientJoin", _join_extra("Alice", 5))
+    reg.handle_server_message("MsgClientJoin", _join_extra("<Logged Out>", 5))
+    reg.handle_server_message("MsgClientJoin", _join_extra("<Connecting>", 5))
+    reg.handle_server_message("MsgClientJoin", _join_extra("Bob", 5))
+    reg.handle_server_message("MsgClientJoin", _join_extra("Alice", 5))  # duplicate
+    p = reg.get(5)
+    # Real names only, first-seen order, no duplicates; placeholders excluded.
+    assert p.associated_usernames == ["Alice", "Bob"]
+    # Current name reflects the latest join (may be a placeholder).
+    assert p.name == "Alice"
+    assert p.to_dict()["associated_usernames"] == ["Alice", "Bob"]
+
+
 def test_tag_precedence_and_ml_strip():
     reg = PlayerListRegistry()
     reg.handle_server_message("MsgClientJoin",

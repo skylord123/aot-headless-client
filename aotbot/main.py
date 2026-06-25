@@ -81,18 +81,43 @@ def _has_credentials(config: Config) -> bool:
 
 async def _main(config: Config, interactive: bool = False) -> None:
     from .client import AotClient
-    from .nodered import Command, NodeRedBridge
+    from .nodered import NodeRedBridge
+    from .websocket import WebSocketServer
 
     client = AotClient(config)
-    bridge = NodeRedBridge(config.nodered_host, config.nodered_port)
     loop = asyncio.get_running_loop()
 
-    # ---- outbound: client events -> Node-RED ---------------------------- #
+    # ---- transports: either, both, or neither --------------------------- #
+    # The bot can bridge to Node-RED (TCP client) and/or host a WebSocket
+    # server. Each is opt-in via config; whichever are enabled receive the same
+    # outbound events and feed the same inbound action handlers.
+    bridge: Optional[NodeRedBridge] = None
+    server: Optional[WebSocketServer] = None
+    # Outbound sinks: async callables taking the JSON object to deliver.
+    sinks: list[Callable[[dict], Awaitable]] = []
+
+    if config.nodered_enabled:
+        bridge = NodeRedBridge(config.nodered_host, config.nodered_port)
+        sinks.append(lambda obj: bridge.send(json.dumps(obj)))
+    if config.websocket_enabled:
+        server = WebSocketServer(config.websocket_host, config.websocket_port)
+        sinks.append(lambda obj: server.send(obj))
+
+    if not sinks:
+        log.warning(
+            "no Node-RED or WebSocket transport configured; running with no "
+            "external bridge (set NODERED_HOST/NODERED_PORT and/or WEBSOCKET_PORT)"
+        )
+
+    # ---- outbound: client events -> all transports ---------------------- #
     # Payloads are JSON objects with an "action" field, matching the in-game
     # Torque bot's Node-RED protocol (base/skylord/bot/NodeRED.cs:
-    # jettisonStringify of a JettisonObject). Node-RED parses payload as JSON.
+    # jettisonStringify of a JettisonObject). Each enabled transport receives
+    # the identical object (Node-RED gets it JSON-encoded; WebSocket clients get
+    # the same object framed). See docs/nodered-protocol.md & websocket-protocol.md.
     def forward(obj: dict) -> None:
-        asyncio.ensure_future(bridge.send(json.dumps(obj)))
+        for sink in sinks:
+            asyncio.ensure_future(sink(obj))
 
     def on_chat(scope: str, name: str, message: str, raw: str) -> None:
         # Mirror TrackPlayerMessage(): action=player_message, isLocal, name, message.
@@ -104,8 +129,39 @@ async def _main(config: Config, interactive: bool = False) -> None:
         })
 
     def on_server_message(msg_type: str, text: str, extra: list) -> None:
-        # Mirror BotNodeRed_onServerMessage(): action=server_message, message.
+        # Only chat-HUD lines reach here (the client filters out empty control
+        # messages, matching onServerMessage's getWordCount gate).
         forward({"action": "server_message", "message": text})
+
+    def on_player_joined(
+        name: str, client_id, location: str, message: str, usernames: list
+    ) -> None:
+        forward({
+            "action": "player_joined",
+            "name": name,
+            "client_id": client_id,
+            "location": location,
+            "message": message,
+            "associated_usernames": usernames,
+        })
+
+    def on_player_dropped(name: str, client_id, message: str, usernames: list) -> None:
+        forward({
+            "action": "player_dropped",
+            "name": name,
+            "client_id": client_id,
+            "message": message,
+            "associated_usernames": usernames,
+        })
+
+    def on_zone_change(player: str, zone: str, client_id) -> None:
+        # Mirror NodeRED.cs TrackPlayerZoneChange: action/player/zone/message.
+        forward({
+            "action": "zone_change",
+            "player": player,
+            "zone": zone,
+            "message": f"{player} entered {zone}",
+        })
 
     def on_login_result(success: bool, detail: str) -> None:
         forward({"action": "login_result", "success": success, "detail": detail})
@@ -115,76 +171,115 @@ async def _main(config: Config, interactive: bool = False) -> None:
 
     client.on_chat = on_chat
     client.on_server_message = on_server_message
+    client.on_player_joined = on_player_joined
+    client.on_player_dropped = on_player_dropped
+    client.on_zone_change = on_zone_change
     client.on_login_result = on_login_result
     client.on_connection_state = on_connection_state
 
-    # ---- inbound: Node-RED command lines -> client actions -------------- #
-    def h_say(cmd: Command) -> None:
-        if cmd.args:
-            client.say(cmd.args[0])
+    # ---- inbound: action handlers (shared by both transports) ----------- #
+    # The actual game-side behavior lives here, expressed against plain Python
+    # values. Each transport adapts its own wire format onto these: Node-RED
+    # parses a text command line into (verb, args); the WebSocket server parses
+    # a JSON object {"action", ...fields}. Both end up calling the same act_*.
+    def act_say(text: str) -> None:
+        if text:
+            client.say(text)
 
-    def h_global(cmd: Command) -> None:
-        if cmd.args:
-            client.global_chat(cmd.args[0])
+    def act_global(text: str) -> None:
+        if text:
+            client.global_chat(text)
 
-    def h_login(cmd: Command) -> None:
-        if len(cmd.args) >= 2:
-            client.login(cmd.args[0], cmd.args[1])
+    def act_login(user: str | None = None, password: str | None = None) -> None:
+        if user and password:
+            client.login(user, password)
         else:
             client.login()
 
-    def h_logout(cmd: Command) -> None:
+    def act_logout() -> None:
         client.logout()
 
-    def h_register(cmd: Command) -> None:
-        # register [user] [pass] -- manual new-character registration (random
-        # appearance). With no args, uses the configured account.
-        if len(cmd.args) >= 2:
-            client.register_new_user(cmd.args[0], cmd.args[1])
+    def act_register(user: str | None = None, password: str | None = None) -> None:
+        # Manual new-character registration (random appearance). Without a
+        # user/pass pair, uses the configured account.
+        if user and password:
+            client.register_new_user(user, password)
         else:
             client.register_new_user()
 
-    def h_raw(cmd: Command) -> None:
-        if cmd.args:
-            client.command_to_server(cmd.args[0], *cmd.args[1:])
+    def act_raw(verb: str | None, args: list) -> None:
+        if verb:
+            client.command_to_server(verb, *args)
 
-    def h_list_objects(cmd: Command) -> None:
-        # list_objects [all] -> {"action":"object_list","objects":[...]}
-        include_removed = bool(cmd.args) and cmd.args[0].lower() in ("all", "1", "true")
+    def act_list_objects(include_removed: bool) -> None:
+        # -> {"action":"object_list","objects":[...]}
         forward({
             "action": "object_list",
             "objects": client.list_objects(include_removed=include_removed),
         })
 
-    def h_players(cmd: Command) -> None:
-        # players -> {"action":"players","players":[...]} -- the online roster,
-        # each joined to its matched Player ghost (object_id/position/full object,
+    def act_players() -> None:
+        # -> {"action":"players","players":[...]} -- the online roster, each
+        # joined to its matched Player ghost (object_id/position/full object,
         # joined_at as a unix timestamp).
         forward({"action": "players", "players": client.get_players()})
 
-    def h_get_object(cmd: Command) -> None:
-        # get_object <ghost_id> -> {"action":"object","object":{...}|null}
+    def act_get_object(ghost_id) -> None:
+        # -> {"action":"object","object":{...}|null}
         obj = None
-        if cmd.args:
+        if ghost_id is not None:
             try:
-                obj = client.get_object(int(cmd.args[0]))
+                obj = client.get_object(int(ghost_id))
             except (ValueError, TypeError):
                 obj = None
         forward({"action": "object", "object": obj})
 
-    async def h_disconnect(cmd: Command) -> None:
-        await client.disconnect("Node-RED requested")
+    async def act_disconnect() -> None:
+        await client.disconnect("bridge requested")
 
-    bridge.register_handler("say", h_say)
-    bridge.register_handler("global", h_global)
-    bridge.register_handler("login", h_login)
-    bridge.register_handler("logout", h_logout)
-    bridge.register_handler("register", h_register)
-    bridge.register_handler("raw", h_raw)
-    bridge.register_handler("list_objects", h_list_objects)
-    bridge.register_handler("players", h_players)
-    bridge.register_handler("get_object", h_get_object)
-    bridge.register_handler("disconnect", h_disconnect)
+    # ---- Node-RED inbound: text command line -> act_* ------------------- #
+    # Mirrors docs/nodered-protocol.md. say/global take the whole remainder as
+    # one text arg; other verbs are shlex-tokenized into cmd.args.
+    if bridge is not None:
+        bridge.register_handler("say", lambda c: act_say(c.args[0] if c.args else ""))
+        bridge.register_handler("global", lambda c: act_global(c.args[0] if c.args else ""))
+        bridge.register_handler("login", lambda c: act_login(*c.args[:2]))
+        bridge.register_handler("logout", lambda c: act_logout())
+        bridge.register_handler("register", lambda c: act_register(*c.args[:2]))
+        bridge.register_handler("raw", lambda c: act_raw(c.args[0], c.args[1:]) if c.args else None)
+        bridge.register_handler(
+            "list_objects",
+            lambda c: act_list_objects(bool(c.args) and c.args[0].lower() in ("all", "1", "true")),
+        )
+        bridge.register_handler("players", lambda c: act_players())
+        bridge.register_handler("get_object", lambda c: act_get_object(c.args[0] if c.args else None))
+        bridge.register_handler("disconnect", lambda c: act_disconnect())
+
+    # ---- WebSocket inbound: JSON object -> act_* ------------------------ #
+    # Mirrors docs/websocket-protocol.md. The "action" selects the handler; the
+    # remaining fields are read by name (e.g. {"action":"say","message":"hi"}).
+    def ws_say(m: dict) -> None:
+        # {"action":"say","message":...,"local":bool}. Defaults to GLOBAL chat;
+        # "local": true sends local/proximity chat. ("global" remains an alias.)
+        message = str(m.get("message", "") or "")
+        if not message:
+            return
+        if m.get("local"):
+            act_say(message)
+        else:
+            act_global(message)
+
+    if server is not None:
+        server.register_handler("say", ws_say)
+        server.register_handler("global", lambda m: act_global(str(m.get("message", "") or "")))
+        server.register_handler("login", lambda m: act_login(m.get("username"), m.get("password")))
+        server.register_handler("logout", lambda m: act_logout())
+        server.register_handler("register", lambda m: act_register(m.get("username"), m.get("password")))
+        server.register_handler("raw", lambda m: act_raw(m.get("verb"), list(m.get("args") or [])))
+        server.register_handler("list_objects", lambda m: act_list_objects(bool(m.get("all"))))
+        server.register_handler("players", lambda m: act_players())
+        server.register_handler("get_object", lambda m: act_get_object(m.get("ghost_id")))
+        server.register_handler("disconnect", lambda m: act_disconnect())
 
     # Clean shutdown on SIGINT/SIGTERM.
     stop = asyncio.Event()
@@ -194,14 +289,23 @@ async def _main(config: Config, interactive: bool = False) -> None:
         except (NotImplementedError, ValueError):
             pass
 
-    await bridge.start()
+    if bridge is not None:
+        await bridge.start()
+    if server is not None:
+        await server.start()
+
+    async def stop_transports() -> None:
+        if bridge is not None:
+            await bridge.stop()
+        if server is not None:
+            await server.stop()
 
     target = config.aot_server_host or f"(resolve via master server {config.aot_master_url})"
     log.info("connecting to AoT server %s port %d", target, config.aot_server_port)
     ok = await client.connect()
     if not ok:
         log.error("connection failed; shutting down")
-        await bridge.stop()
+        await stop_transports()
         return
 
     if not _has_credentials(config):
@@ -228,7 +332,7 @@ async def _main(config: Config, interactive: bool = False) -> None:
         if repl_task is not None:
             repl_task.cancel()
         await client.disconnect("aotbot shutting down")
-        await bridge.stop()
+        await stop_transports()
 
 
 def main(argv: list[str] | None = None) -> int:

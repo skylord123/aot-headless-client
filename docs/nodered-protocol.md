@@ -30,8 +30,9 @@ alice: hello\n\n\n
 ```
 
 The bot forwards received chat/server messages and login/connection state
-changes outbound (the exact outbound message shapes are owned by the game
-client module, not the bridge).
+changes outbound, and replies to query commands. The exact outbound message
+shapes are owned by the game client module (`aotbot/main.py`), not the bridge;
+they are documented in [Outbound messages](#outbound-messages) below.
 
 ### Inbound (Node-RED -> bot)
 
@@ -61,18 +62,27 @@ Each inbound line is parsed into a structured command `(verb, args, raw)` and
 dispatched to the handler registered for `verb` (or a default handler). The
 verb is **case-insensitive** (normalized to lowercase).
 
-| Command                  | Args                         | Intended game action                        |
-| ------------------------ | ---------------------------- | ------------------------------------------- |
-| `say <text>`             | `[text]`                     | local/proximity chat: `commandToServer('Talk', text)` |
-| `global <text>`          | `[text]`                     | global chat: `commandToServer('MessageSent', text)`   |
-| `login <user> <pass>`    | `[user, pass]`               | log in (`commandToServer('login', user, getStringCRC(pass))`) |
-| `logout`                 | `[]`                         | log out                                     |
-| `connect <host:port>`    | `[host:port]`                | connect to a game server                    |
-| `disconnect`             | `[]`                         | disconnect from the game server             |
-| `raw <verb> <args...>`   | `[verb, *args]`              | arbitrary `commandToServer(verb, args...)`  |
+The bridge only **parses and dispatches**. The command set below is wired up by
+the game client module (`aotbot/main.py`); the bridge itself knows nothing about
+these specific verbs.
 
-> The bridge only **parses and dispatches**; the mapping to `commandToServer`
-> verbs above is implemented by the game client module's handlers.
+| Command                  | Args (parsed)                | Effect                                                       |
+| ------------------------ | ---------------------------- | ----------------------------------------------------------- |
+| `say <text>`             | `[text]`                     | Local/proximity chat. No-op if `text` is empty.             |
+| `global <text>`          | `[text]`                     | Global chat. No-op if `text` is empty.                      |
+| `login`                  | `[]`                         | Log in with the configured account credentials.             |
+| `login <user> <pass>`    | `[user, pass]`               | Log in as `user` with password `pass`.                      |
+| `logout`                 | `[]`                         | Log out of the current account.                             |
+| `register`               | `[]`                         | Register a new character for the configured account (random appearance). |
+| `register <user> <pass>` | `[user, pass]`               | Register a new character `user` with password `pass`.       |
+| `disconnect`             | `[]`                         | Disconnect from the game server.                            |
+| `raw <verb> <args...>`   | `[verb, *args]`              | Arbitrary `commandToServer(verb, *args)` — escape hatch for any server command. |
+| `players`                | `[]`                         | Request the online roster. Replies with a `players` message. |
+| `list_objects [all]`     | `[]` or `[all\|1\|true]`     | Request the tracked object list (with `all`/`1`/`true`, includes removed objects). Replies with `object_list`. |
+| `get_object <ghost_id>`  | `[ghost_id]`                 | Request one object by integer ghost id. Replies with `object` (`null` if missing/invalid). |
+
+The three `players` / `list_objects` / `get_object` query commands trigger a JSON
+reply — see [Outbound messages](#outbound-messages).
 
 ### Parsing rules
 
@@ -80,10 +90,11 @@ verb is **case-insensitive** (normalized to lowercase).
 - `say` / `global` — the entire remainder of the line is taken as a **single
   text argument**, with internal whitespace and any quote characters preserved
   verbatim. No quoting is needed for chat text.
-- `login` / `connect` / `raw` — the remainder is tokenized with **shell-like
-  quoting** (`shlex`), so multi-word arguments can be quoted. If the quoting is
-  unbalanced, the parser falls back to a plain whitespace split (never raises).
-- `logout` / `disconnect` — take no arguments.
+- **All other verbs** — the remainder is tokenized with **shell-like quoting**
+  (`shlex`), so multi-word arguments can be quoted. If the quoting is unbalanced,
+  the parser falls back to a plain whitespace split (never raises).
+- Verbs that take no arguments (`logout`, `disconnect`, `players`) ignore any
+  extra tokens.
 - **Unknown verbs** are still parsed into a command and dispatched to the
   default handler (if any); otherwise the line is logged and ignored.
 
@@ -102,8 +113,11 @@ login alice s3cret
 logout
   -> verb="logout"  args=[]
 
-connect 127.0.0.1:28000
-  -> verb="connect" args=["127.0.0.1:28000"]
+list_objects all
+  -> verb="list_objects" args=["all"]
+
+get_object 1234
+  -> verb="get_object"   args=["1234"]
 
 disconnect
   -> verb="disconnect" args=[]
@@ -111,6 +125,83 @@ disconnect
 raw Talk "hello world" 42
   -> verb="raw"     args=["Talk", "hello world", "42"]
 ```
+
+## Outbound messages
+
+Outbound payloads are **JSON objects**, each sent as one line terminated by
+`\n\n\n` (so Node-RED can `JSON.parse` the payload). Every object carries an
+`"action"` discriminator. As with inbound parsing, the bridge only transports
+the bytes — these shapes are produced by the game client module (`aotbot/main.py`)
+and mirror the in-engine Torque bot (`base/skylord/bot/NodeRED.cs`).
+
+They fall into two groups.
+
+### Event pushes
+
+Emitted asynchronously as game state changes:
+
+| `action`           | Fields                                  | Meaning                                          |
+| ------------------ | --------------------------------------- | ------------------------------------------------ |
+| `player_message`   | `isLocal` (bool), `name`, `message`     | Chat from another player; `isLocal` distinguishes local/proximity from global chat. |
+| `server_message`   | `message`                               | A server/system message that reaches the chat HUD. Only **non-empty** chat-HUD lines are emitted; empty control-message strings are suppressed (see note below). |
+| `player_joined`    | `name`, `client_id` (int\|null), `location`, `message`, `associated_usernames` (array) | A client appeared in the roster (`MsgClientJoin`). `message` is the chat-HUD line if any (often empty). `associated_usernames` is every real character name this `client_id` has used this session. |
+| `player_dropped`   | `name`, `client_id` (int\|null), `message`, `associated_usernames` (array) | A client left the roster (`MsgClientDrop`). `message` is the chat-HUD line, e.g. `"<name> has left the game."`. `associated_usernames` is the full name history (captured before the client is removed). |
+| `zone_change`      | `player`, `zone`, `message`             | A player moved to a new world zone/region (`MsgClientScoreChanged`). `message` is `"<player> entered <zone>"`. Skipped for logged-out/connecting placeholders and unknown clients. |
+| `login_result`     | `success` (bool), `detail`              | Outcome of a login attempt.                      |
+| `connection_state` | `state`                                 | Connection lifecycle change (e.g. connecting/connected/disconnected). |
+
+The server multiplexes everything through one tagged `ServerMessage` command.
+The engine adds a chat-HUD line only when the message text is non-empty
+(`onServerMessage` / `getWordCount` in `base/client/message.cs` + `chatHud.cs`),
+and routes the tagged `MsgClientJoin` / `MsgClientDrop` control messages to the
+player-list handlers. The bot mirrors this: **`server_message` is emitted only
+for non-empty chat-HUD lines** (so the empty roster-sync `MsgClientJoin` /
+`MsgClientScoreChanged` spam is dropped), while `MsgClientJoin` / `MsgClientDrop`
+become structured **`player_joined` / `player_dropped`** events. A message that
+is both a roster change and a HUD line (e.g. `"<name> has left the game."`)
+produces both. Note the server re-sends `MsgClientJoin` for everyone already
+online when the bot connects (and for `"<Connecting>"` / `"<Logged Out>"`
+placeholders), so `player_joined` means "roster entry appeared", not strictly a
+brand-new login — filter on `name` if you only want real logins.
+
+A single connection (`client_id`) can log out and back in as a **different**
+character without dropping (each fires a new `MsgClientJoin`). The bot
+accumulates every real character name seen for a `client_id` into
+`associated_usernames` (first-seen order, de-duplicated); logged-out placeholder
+names (anything starting with `<`, which a real username can never contain) are
+excluded. It is reported on `player_joined`, `player_dropped`, and each `players`
+reply entry. The history is per connection — when the client drops, the
+`client_id` is freed and the history is gone.
+
+### Query replies
+
+Emitted in response to an inbound query command:
+
+| `action`      | In reply to    | Fields                          | Meaning                                            |
+| ------------- | -------------- | ------------------------------- | -------------------------------------------------- |
+| `players`     | `players`      | `players` (array)               | The online roster, each entry joined to its Player ghost. |
+| `object_list` | `list_objects` | `objects` (array)               | The tracked object/ghost list.                     |
+| `object`      | `get_object`   | `object` (object \| `null`)     | One object; `null` when the ghost id is unknown or unparseable. |
+
+### Examples
+
+One JSON object per line (terminator omitted for readability):
+
+```text
+{"action": "player_message", "isLocal": true, "name": "alice", "message": "hello"}
+{"action": "server_message", "message": "Server restarting in 5 minutes"}
+{"action": "player_joined", "name": "DiscordBot", "client_id": 38239, "location": "Port Town", "message": "", "associated_usernames": ["DiscordBot"]}
+{"action": "player_dropped", "name": "What's For Dinner", "client_id": 39570, "message": "What's For Dinner has left the game.", "associated_usernames": ["What's For Dinner"]}
+{"action": "zone_change", "player": "alice", "zone": "Port Town", "message": "alice entered Port Town"}
+{"action": "login_result", "success": true, "detail": "ok"}
+{"action": "connection_state", "state": "connected"}
+{"action": "players", "players": [{"name": "alice", "client_id": 7, "object_id": 1234, "associated_usernames": ["alice"]}]}
+{"action": "object_list", "objects": [{"id": 1234, "class": "Player"}]}
+{"action": "object", "object": {"id": 1234, "class": "Player"}}
+```
+
+(The `players` / `object_list` / `object` array element shapes are owned by the
+game client's object tracking; the fields shown are illustrative.)
 
 ## Logging
 

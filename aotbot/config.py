@@ -77,9 +77,17 @@ class Config:
     # empty (parses the "IP <addr>" line; see aotbot.masterserver).
     aot_master_url: str = DEFAULT_MASTER_URL
 
-    # Node-RED TCP bridge.
-    nodered_host: str = "localhost"
-    nodered_port: int = 1881
+    # Node-RED TCP bridge (optional). The bot connects out to Node-RED as a TCP
+    # client. BOTH host and port must be set to enable it; leave either blank
+    # (empty ``nodered_host`` / ``None`` ``nodered_port``) to disable Node-RED.
+    nodered_host: str = ""
+    nodered_port: int | None = None
+
+    # WebSocket server (optional). When ``websocket_port`` is set, the bot HOSTS
+    # a WebSocket server on ``websocket_host``:``websocket_port`` that clients
+    # (e.g. Node-RED) connect to for bi-directional JSON. ``None`` disables it.
+    websocket_host: str = "0.0.0.0"
+    websocket_port: int | None = None
 
     # Auto-create the character if login fails with "Character does not exist!".
     # Mirrors $SKYLORD::ENV::BOT::AUTO_LOGIN::CREATE_USER::* in the in-game bot.
@@ -154,9 +162,20 @@ class Config:
             env.get("AOT_MASTER_URL", DEFAULT_MASTER_URL).strip() or DEFAULT_MASTER_URL
         )
 
-        nodered_host = env.get("NODERED_HOST", "localhost").strip() or "localhost"
-        nodered_port = _to_int(
-            env.get("NODERED_PORT", "1881"), var="NODERED_PORT"
+        # Node-RED is opt-in: only enabled when BOTH host and port are provided.
+        nodered_host = env.get("NODERED_HOST", "").strip()
+        nodered_port_raw = env.get("NODERED_PORT", "").strip()
+        nodered_port = (
+            _to_int(nodered_port_raw, var="NODERED_PORT") if nodered_port_raw else None
+        )
+
+        # WebSocket server is opt-in: only started when a port is provided.
+        websocket_host = env.get("WEBSOCKET_HOST", "0.0.0.0").strip() or "0.0.0.0"
+        websocket_port_raw = env.get("WEBSOCKET_PORT", "").strip()
+        websocket_port = (
+            _to_int(websocket_port_raw, var="WEBSOCKET_PORT")
+            if websocket_port_raw
+            else None
         )
 
         log_level = (env.get("LOG_LEVEL", "info").strip() or "info").lower()
@@ -187,6 +206,8 @@ class Config:
             aot_master_url=master_url,
             nodered_host=nodered_host,
             nodered_port=nodered_port,
+            websocket_host=websocket_host,
+            websocket_port=websocket_port,
             aot_create_user=create_user,
             aot_create_overwrite=create_overwrite,
             aot_create_abilities=create_abilities,
@@ -232,9 +253,13 @@ class Config:
             raise ConfigError(
                 f"AOT_SERVER_PORT must be in 1..65535, got {self.aot_server_port}."
             )
-        if not (0 < self.nodered_port < 65536):
+        if self.nodered_port is not None and not (0 < self.nodered_port < 65536):
             raise ConfigError(
                 f"NODERED_PORT must be in 1..65535, got {self.nodered_port}."
+            )
+        if self.websocket_port is not None and not (0 < self.websocket_port < 65536):
+            raise ConfigError(
+                f"WEBSOCKET_PORT must be in 1..65535, got {self.websocket_port}."
             )
         valid_levels = {"debug", "info", "warning", "error", "critical"}
         if self.log_level not in valid_levels:
@@ -242,6 +267,20 @@ class Config:
                 f"LOG_LEVEL={self.log_level!r} invalid; "
                 f"expected one of {', '.join(sorted(valid_levels))}."
             )
+
+    @property
+    def nodered_enabled(self) -> bool:
+        """True when the Node-RED TCP bridge should be started.
+
+        Requires BOTH a non-empty host and a port (mirrors the ``.env`` rule
+        that a missing ``NODERED_HOST`` *or* ``NODERED_PORT`` disables Node-RED).
+        """
+        return bool(self.nodered_host) and self.nodered_port is not None
+
+    @property
+    def websocket_enabled(self) -> bool:
+        """True when the WebSocket server should be hosted (port is set)."""
+        return self.websocket_port is not None
 
     def redacted(self) -> "Config":
         """Return a copy with the password masked, safe to log/repr."""

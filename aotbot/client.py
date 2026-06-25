@@ -50,16 +50,35 @@ def _strip_ml_control_chars(s: str) -> str:
     return "".join(c for c in s if c == " " or ord(c) >= 0x20)
 
 
-def _format_server_message(template: str, params: list[str]) -> str:
-    """Substitute %1..%9 placeholders in a server-message template with the
-    trailing args, then strip ML control chars and trim -- mirroring the line the
-    engine builds for onServerMessage. ``params[0]`` is %1, ``params[1]`` is %2, …
-    Done high-to-low so a longer token isn't clobbered by a shorter one.
+def _substitute_placeholders(template: str, params: list[str]) -> str:
+    """Replace %1..%9 placeholders in a template with the trailing args.
+
+    ``params[0]`` is %1, ``params[1]`` is %2, … Done high-to-low so a longer
+    token isn't clobbered by a shorter one. This is the substitution the engine
+    performs for both ``clientCmdServerMessage`` and ``clientCmdChatMessage``.
     """
     s = template
     for i in range(min(len(params), 9), 0, -1):
         s = s.replace("%" + str(i), params[i - 1])
-    return _strip_ml_control_chars(s).strip()
+    return s
+
+
+def _format_server_message(template: str, params: list[str]) -> str:
+    """Substitute %1..%9 placeholders in a server-message template with the
+    trailing args, then strip ML control chars and trim -- mirroring the line the
+    engine builds for onServerMessage.
+    """
+    return _strip_ml_control_chars(_substitute_placeholders(template, params)).strip()
+
+
+def _parse_client_id(value) -> Optional[int]:
+    """Parse a MsgClient* ``clientId`` arg to int; ``None`` if missing/unparseable."""
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return None
 
 
 def _should_randomize(value) -> bool:
@@ -151,6 +170,22 @@ class AotClient:
         # Public callbacks (assign directly; may be sync or async).
         self.on_chat: Optional[Callable[[str, str, str, str], None]] = None
         self.on_server_message: Optional[Callable[[str, str, list], None]] = None
+        # Player roster changes (parsed from MsgClientJoin / MsgClientDrop).
+        # associated_usernames is every real character name this client_id has
+        # used this session (logged-out placeholders excluded).
+        #   on_player_joined(name, client_id, location, message, associated_usernames)
+        #   on_player_dropped(name, client_id, message, associated_usernames)
+        self.on_player_joined: Optional[
+            Callable[[str, Optional[int], str, str, list], None]
+        ] = None
+        self.on_player_dropped: Optional[
+            Callable[[str, Optional[int], str, list], None]
+        ] = None
+        # A player changed world zone/region (parsed from MsgClientScoreChanged).
+        #   on_zone_change(player, zone, client_id)
+        self.on_zone_change: Optional[
+            Callable[[str, str, Optional[int]], None]
+        ] = None
         self.on_login_result: Optional[Callable[[bool, str], None]] = None
         self.on_connection_state: Optional[Callable[[str], None]] = None
 
@@ -424,12 +459,19 @@ class AotClient:
     # ------------------------------------------------------------------ #
 
     def _on_chat_message(self, args: list[str], evt: RemoteCommandEvent) -> None:
-        # clientCmdChatMessage(%sender, %voice, %pitch, %msgString, ...) -- stock
-        # Torque layout. The formatted HUD line we parse is %msgString = args[3]
-        # (args[0] is the sender client/ghost id). This is the same string the
-        # engine passes to onChatMessage(), which the in-game bot's
-        # Chat_onChatMessage parses.
-        line = args[3] if len(args) > 3 else (args[-1] if args else "")
+        # clientCmdChatMessage(%sender, %voice, %pitch, %msgString, %a1..%a10) --
+        # stock Torque layout. %msgString = args[3] is a TEMPLATE with %1..%9
+        # placeholders (e.g. "%1: %2" for global, '%1 says, "%2"' for local); the
+        # trailing args[4:] are the substitution params (%1 -> args[4], ...), just
+        # like clientCmdServerMessage. We substitute first, then parse the
+        # resulting HUD line exactly as the in-game bot's Chat_onChatMessage does.
+        # (A single pre-formatted arg, with no params, passes through unchanged.)
+        logger.debug("ChatMessage raw args: %r", args)
+        if len(args) > 3:
+            template, params = args[3], args[4:]
+        else:
+            template, params = (args[-1] if args else ""), []
+        line = _substitute_placeholders(template, params)
         parsed = parse_chat_line(line)
         logger.info(
             "chat[%s] %s: %s", parsed["scope"], parsed["name"], parsed["message"]
@@ -448,14 +490,86 @@ class AotClient:
         msg_type = args[0] if len(args) > 0 else ""
         template = args[1] if len(args) > 1 else ""
         extra = args[2:]
+        tag = msg_type.split(" ", 1)[0] if msg_type else ""
+
+        # On a drop the registry removes the entry, so capture its accumulated
+        # username history BEFORE updating the roster (so the player_dropped
+        # event can still report every character that client_id ever used).
+        dropped_usernames: list[str] = []
+        if tag == "MsgClientDrop":
+            drop_id = _parse_client_id(extra[1] if len(extra) > 1 else None)
+            if drop_id is not None:
+                existing = self.players.get(drop_id)
+                if existing is not None:
+                    dropped_usernames = list(existing.associated_usernames)
+
         # Player-roster messages (MsgClientJoin/Drop/ScoreChanged) drive the
         # online-player list exactly like playerList.cs's addMessageCallback
-        # handlers. The raw (de-tagged) args feed the roster; we still format and
-        # forward the human line below like any other server message.
+        # handlers. The raw (de-tagged) args feed the roster.
         self.players.handle_server_message(msg_type, extra)
+
+        # The human-readable chat-HUD line. The engine fans every server message
+        # out to the default message callback -> onServerMessage(detag(msg)),
+        # which only does ChatHud.addLine() when the line has word content
+        # (getWordCount). So most tagged control messages (MsgClientJoin/Drop/
+        # ScoreChanged) carry an EMPTY msgString and never reach the HUD. We
+        # mirror that: a `server_message` event is emitted ONLY for non-empty text
+        # (see base/client/message.cs + chatHud.cs onServerMessage).
         text = _format_server_message(template, extra)
-        logger.info("server message [%s]: %s", msg_type, text)
-        self._emit(self.on_server_message, msg_type, text, extra)
+
+        # Structured player join/drop events, parsed from the tagged-message args
+        # the same way playerList.cs handleClientJoin/handleClientDrop do. The
+        # client name is the first trailing arg (StripMLControlChars(detag(...)));
+        # MsgClientJoin also carries clientId/location. NOTE: the server re-sends
+        # MsgClientJoin for everyone already online when WE connect (roster sync),
+        # and for placeholder states like "<Connecting>"/"<Logged Out>", so these
+        # events represent roster changes, not strictly brand-new logins.
+        if tag == "MsgClientJoin":
+            name = _strip_ml_control_chars(str(extra[0])).strip() if extra else ""
+            client_id = _parse_client_id(extra[1] if len(extra) > 1 else None)
+            location = (
+                _strip_ml_control_chars(str(extra[3])).strip()
+                if len(extra) > 3 else ""
+            )
+            # The roster (updated above) now holds the full username history.
+            info = self.players.get(client_id) if client_id is not None else None
+            usernames = list(info.associated_usernames) if info is not None else []
+            logger.info(
+                "player joined: %s (id=%s, loc=%s, usernames=%s)",
+                name, client_id, location, usernames,
+            )
+            self._emit(
+                self.on_player_joined, name, client_id, location, text, usernames
+            )
+        elif tag == "MsgClientDrop":
+            name = _strip_ml_control_chars(str(extra[0])).strip() if extra else ""
+            client_id = _parse_client_id(extra[1] if len(extra) > 1 else None)
+            logger.info(
+                "player dropped: %s (id=%s, usernames=%s)",
+                name, client_id, dropped_usernames,
+            )
+            self._emit(
+                self.on_player_dropped, name, client_id, text, dropped_usernames
+            )
+        elif tag == "MsgClientScoreChanged":
+            # MsgClientScoreChanged(zone, clientId): despite the name, this AoT
+            # server repurposes the "score" message as a world-zone change. We
+            # mirror NodeRED.cs playerTrackerClientZoneChange: resolve the player
+            # name from the roster (by clientId), skip logged-out/connecting
+            # placeholders, and emit a zone_change. extra[0]=zone, extra[1]=id.
+            zone = _strip_ml_control_chars(str(extra[0])).strip() if extra else ""
+            client_id = _parse_client_id(extra[1] if len(extra) > 1 else None)
+            info = self.players.get(client_id) if client_id is not None else None
+            player = info.name if info is not None else ""
+            if player and not player.startswith("<"):
+                logger.info(
+                    "zone change: %s entered %s (id=%s)", player, zone, client_id
+                )
+                self._emit(self.on_zone_change, player, zone, client_id)
+
+        if text:
+            logger.info("server message [%s]: %s", msg_type, text)
+            self._emit(self.on_server_message, msg_type, text, extra)
         # New-character creation confirmation: "New character created: <name>".
         # Mirrors NewCharacter_onServerMessage + botCreateUserSuccess (which marks
         # us logged in); the server logs us in as part of creation.

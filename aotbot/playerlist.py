@@ -41,6 +41,17 @@ def _norm_name(s: Optional[str]) -> str:
     return _strip_ml(s or "").strip().lower()
 
 
+def _is_real_username(name: str) -> bool:
+    """True for an actual character name (vs. a logged-out placeholder).
+
+    The server uses ``<Logged Out>`` / ``<Connecting>`` (and ``<Logged Out>.1``
+    etc.) as the roster name while a client has no character selected. A real
+    username can never contain ``<``, so a leading ``<`` reliably marks a
+    placeholder we don't want to record.
+    """
+    return bool(name) and not name.startswith("<")
+
+
 def _to_int(value: Any, default: int = 0) -> int:
     try:
         return int(str(value).strip())
@@ -72,6 +83,16 @@ class PlayerInfo:
     # when the bot connects (the server re-sends MsgClientJoin for everyone on
     # connect), this is the bot's connect time, not their true join time.
     joined_at: float = field(default_factory=time.time)
+    # Every real character name this client_id has been seen using, in first-seen
+    # order. A single connection can log out and back in as a different character
+    # (each fires a fresh MsgClientJoin), so this accumulates the history.
+    # Logged-out placeholders ("<Logged Out>"/"<Connecting>") are never recorded.
+    associated_usernames: List[str] = field(default_factory=list)
+
+    def record_username(self, name: str) -> None:
+        """Append ``name`` to the username history if it's a new real username."""
+        if _is_real_username(name) and name not in self.associated_usernames:
+            self.associated_usernames.append(name)
 
     @property
     def tag(self) -> str:
@@ -94,6 +115,7 @@ class PlayerInfo:
             "is_super_admin": self.is_super_admin,
             "tag": self.tag,
             "joined_at": int(self.joined_at),  # unix timestamp (seconds)
+            "associated_usernames": list(self.associated_usernames),
         }
 
 
@@ -132,7 +154,7 @@ class PlayerListRegistry:
         is_super = _to_bool(_get(extra, 6))
         existing = self._players.get(client_id)
         if existing is None:
-            self._players[client_id] = PlayerInfo(
+            existing = self._players[client_id] = PlayerInfo(
                 client_id=client_id, name=name, location=location, is_ai=is_ai,
                 is_admin=is_admin, is_super_admin=is_super,
             )
@@ -143,6 +165,8 @@ class PlayerListRegistry:
             existing.is_ai = is_ai
             existing.is_admin = is_admin
             existing.is_super_admin = is_super
+        # Accumulate the username history (ignores logged-out placeholders).
+        existing.record_username(name)
 
     def _drop(self, extra: List[Any]) -> None:
         # handleClientDrop(name, clientId) == extra[0..1].
@@ -159,6 +183,9 @@ class PlayerListRegistry:
             p.location = location
 
     # -- query ------------------------------------------------------------- #
+
+    def get(self, client_id: int) -> Optional[PlayerInfo]:
+        return self._players.get(client_id)
 
     def list(self) -> List[PlayerInfo]:
         return sorted(self._players.values(), key=lambda p: (p.name.lower(), p.client_id))

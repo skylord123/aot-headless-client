@@ -55,9 +55,13 @@ def test_load_required_only_uses_defaults():
     assert cfg.aot_server_port == 28000
     assert cfg.aot_username == "botuser"
     assert cfg.aot_password == "s3cret"
-    # Defaults.
-    assert cfg.nodered_host == "localhost"
-    assert cfg.nodered_port == 1881
+    # Defaults: both transports are opt-in and disabled when unset.
+    assert cfg.nodered_host == ""
+    assert cfg.nodered_port is None
+    assert cfg.nodered_enabled is False
+    assert cfg.websocket_host == "0.0.0.0"
+    assert cfg.websocket_port is None
+    assert cfg.websocket_enabled is False
     assert cfg.log_level == "info"
     assert cfg.dump_packets is False
     assert cfg.aot_skip_lighting is True
@@ -76,9 +80,50 @@ def test_load_full_env():
     )
     assert cfg.nodered_host == "nr.local"
     assert cfg.nodered_port == 2000
+    assert cfg.nodered_enabled is True
     assert cfg.log_level == "debug"  # normalized to lowercase
     assert cfg.dump_packets is True
     assert cfg.aot_skip_lighting is False
+
+
+# --- Transport opt-in (Node-RED + WebSocket) ------------------------------
+
+
+def test_nodered_disabled_when_host_missing():
+    cfg = _load_from({**REQUIRED, "NODERED_PORT": "1881"})
+    assert cfg.nodered_host == ""
+    assert cfg.nodered_port == 1881
+    assert cfg.nodered_enabled is False  # host missing -> disabled
+
+
+def test_nodered_disabled_when_port_missing():
+    cfg = _load_from({**REQUIRED, "NODERED_HOST": "localhost"})
+    assert cfg.nodered_host == "localhost"
+    assert cfg.nodered_port is None
+    assert cfg.nodered_enabled is False  # port missing -> disabled
+
+
+def test_nodered_enabled_when_both_set():
+    cfg = _load_from({**REQUIRED, "NODERED_HOST": "localhost", "NODERED_PORT": "1881"})
+    assert cfg.nodered_enabled is True
+
+
+def test_websocket_enabled_when_port_set():
+    cfg = _load_from({**REQUIRED, "WEBSOCKET_PORT": "8765"})
+    assert cfg.websocket_port == 8765
+    assert cfg.websocket_host == "0.0.0.0"
+    assert cfg.websocket_enabled is True
+
+
+def test_websocket_custom_host():
+    cfg = _load_from({**REQUIRED, "WEBSOCKET_HOST": "127.0.0.1", "WEBSOCKET_PORT": "9000"})
+    assert cfg.websocket_host == "127.0.0.1"
+    assert cfg.websocket_port == 9000
+
+
+def test_bad_websocket_port_raises():
+    with pytest.raises(ConfigError):
+        _load_from({**REQUIRED, "WEBSOCKET_PORT": "70000"})
 
 
 def test_config_is_frozen():

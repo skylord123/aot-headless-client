@@ -15,31 +15,90 @@ Wire conventions (must match ``NodeRED.cs``)
 - Auto-reconnect with backoff: 1s for the first few attempts, then 5s, matching
   ``NodeRED::_retry_connect`` (``connection_attempts < 5 ? 1000 : 5000``).
 
-Inbound command grammar
-------------------------
+Inbound commands (Node-RED -> bot)
+----------------------------------
 Each inbound line is parsed into a :class:`Command` ``(verb, args, raw)`` and
-dispatched to a registered handler. The documented grammar (see also
-``docs/nodered-protocol.md``) is::
+dispatched to the handler registered for ``verb`` (or the default handler). This
+module owns only the parse + dispatch; the verb-to-action mapping below is
+implemented by the game client wiring in ``aotbot/main.py`` and is reproduced
+here as the authoritative command reference. See also
+``docs/nodered-protocol.md``.
 
-    say <text>              # local/proximity chat   -> commandToServer('Talk', text)
-    global <text>           # global chat            -> commandToServer('MessageSent', text)
-    login <user> <pass>     # log in
-    logout                  # log out
-    connect <host:port>     # connect to a game server
-    disconnect              # disconnect from the game server
-    raw <verb> <args...>    # arbitrary commandToServer(verb, args...)
+================  ==========================  ==================================================
+Command           Args (parsed)               Effect
+================  ==========================  ==================================================
+``say <text>``    ``[text]``                  Local/proximity chat. No-op if ``text`` is empty.
+``global <text>`` ``[text]``                  Global chat. No-op if ``text`` is empty.
+``login``         ``[]``                      Log in with the configured account credentials.
+``login <u> <p>`` ``[user, pass]``            Log in as ``user`` with password ``pass``.
+``logout``        ``[]``                      Log out of the current account.
+``register``      ``[]``                      Register a new character for the configured
+                                              account (random appearance).
+``register <u>    ``[user, pass]``            Register a new character ``user`` with password
+<p>``                                         ``pass``.
+``disconnect``    ``[]``                      Disconnect from the game server (async handler).
+``raw <verb>      ``[verb, *args]``           Arbitrary ``commandToServer(verb, *args)`` — an
+<args...>``                                   escape hatch for any server command.
+``players``       ``[]``                      Request the online roster. Replies with an
+                                              outbound ``players`` message (see below).
+``list_objects    ``[]`` or ``[all|1|true]``  Request the tracked object/ghost list. With an
+[all]``                                       ``all``/``1``/``true`` arg, includes removed
+                                              objects. Replies with ``object_list``.
+``get_object      ``[ghost_id]``              Request one object by integer ghost id. Replies
+<ghost_id>``                                  with ``object`` (``null`` if id missing/invalid).
+================  ==========================  ==================================================
 
 Parsing rules:
 
 - The first whitespace-delimited token is the lowercased ``verb``.
 - ``say`` / ``global`` take the entire remainder of the line as a single text
-  argument (no quoting needed, whitespace preserved).
-- ``login`` / ``connect`` / ``raw`` are tokenized with shell-like quoting
-  (``shlex``) so multi-word arguments can be quoted, e.g.
-  ``raw Talk "hello world"`` -> verb ``Talk`` with one arg ``hello world``.
-- ``logout`` / ``disconnect`` take no arguments.
-- Unknown verbs are still parsed into a :class:`Command` and dispatched; the
-  handler decides what to do (it may log/ignore).
+  argument (no quoting needed, whitespace and quote characters preserved).
+- All other verbs are tokenized with shell-like quoting (``shlex``) so
+  multi-word arguments can be quoted, e.g. ``raw Talk "hello world"`` -> verb
+  ``Talk`` with one arg ``hello world``. Unbalanced quoting never raises; it
+  falls back to a plain whitespace split.
+- Verbs that take no arguments (``logout``, ``disconnect``, ``players``) ignore
+  any extra tokens.
+- Unknown verbs are still parsed into a :class:`Command` and dispatched to the
+  default handler; with no default handler the line is logged and ignored.
+
+Outbound messages (bot -> Node-RED)
+------------------------------------
+Outbound payloads are JSON objects sent as one line (terminated by
+``"\n\n\n"``), each carrying an ``"action"`` discriminator. As with inbound
+parsing, the bridge only transports the bytes — these shapes are produced by
+``aotbot/main.py`` and mirror the in-engine Torque bot
+(``base/skylord/bot/NodeRED.cs``). They fall into two groups.
+
+Event pushes (emitted as game state changes):
+
+- ``{"action": "player_message", "isLocal": bool, "name": str, "message": str}``
+  — a chat message from another player; ``isLocal`` distinguishes
+  local/proximity chat from global.
+- ``{"action": "server_message", "message": str}`` — a server/system message
+  that reaches the chat HUD (empty control-message strings are suppressed).
+- ``{"action": "player_joined", "name": str, "client_id": int|null,
+  "location": str, "message": str, "associated_usernames": [str, ...]}`` — a
+  client appeared in the roster (``MsgClientJoin``; also re-sent for everyone
+  online when the bot connects). ``associated_usernames`` is every real
+  character name this ``client_id`` has used this session.
+- ``{"action": "player_dropped", "name": str, "client_id": int|null,
+  "message": str, "associated_usernames": [str, ...]}`` — a client left the
+  roster (``MsgClientDrop``).
+- ``{"action": "zone_change", "player": str, "zone": str, "message": str}`` — a
+  player moved to a new world zone/region (``MsgClientScoreChanged``).
+- ``{"action": "login_result", "success": bool, "detail": str}`` — the outcome
+  of a login attempt.
+- ``{"action": "connection_state", "state": str}`` — a connection lifecycle
+  change (e.g. connecting/connected/disconnected).
+
+Request replies (emitted in response to an inbound command):
+
+- ``{"action": "players", "players": [...]}`` — reply to ``players``: the online
+  roster, each entry joined to its Player ghost.
+- ``{"action": "object_list", "objects": [...]}`` — reply to ``list_objects``.
+- ``{"action": "object", "object": {...} | null}`` — reply to ``get_object``;
+  ``null`` when the ghost id is unknown or unparseable.
 """
 
 from __future__ import annotations
