@@ -16,7 +16,8 @@ Callbacks (set the attribute, sync or async):
     on_chat(scope, name, msg, raw)
     on_server_message(msg_type, text, raw_args)
     on_login_result(success, detail)
-    on_connection_state(state_name)
+    on_connection_state(state, logged_in)
+    on_sync_clock(uptime_seconds, received_at)
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ import asyncio
 import inspect
 import logging
 import random
+import time
 from typing import Callable, Optional
 
 from . import protocol_constants as pc
@@ -152,22 +154,16 @@ class AotClient:
     def __init__(self, config: Config) -> None:
         self.config = config
 
+        # --- Persistent state (survives reconnects) ---------------------- #
+        # The UDP transport is reused across reconnects: connect() reopens it and
+        # disconnect() closes it, so a single instance handles every attempt.
         self.transport = UdpTransport()
-        self.events = EventManager()
-        self.phases = GameConnectionPhases(
-            self.events,
-            skip_lighting=config.aot_skip_lighting,
-            track_objects=config.aot_track_objects,
-        )
-        self.conn: Optional[NetConnection] = None
         # Host resolved from the master server (when AOT_SERVER_HOST is empty),
         # cached so reconnects don't re-fetch.
         self._resolved_host: Optional[str] = None
 
-        # Online-player roster (fed by MsgClientJoin/Drop/ScoreChanged).
-        self.players = PlayerListRegistry()
-
-        # Public callbacks (assign directly; may be sync or async).
+        # Public callbacks (assign directly; may be sync or async). These are set
+        # by the owner (main.py / REPL) and MUST survive reset()/reconnect.
         self.on_chat: Optional[Callable[[str, str, str, str], None]] = None
         self.on_server_message: Optional[Callable[[str, str, list], None]] = None
         # Player roster changes (parsed from MsgClientJoin / MsgClientDrop).
@@ -187,9 +183,41 @@ class AotClient:
             Callable[[str, str, Optional[int]], None]
         ] = None
         self.on_login_result: Optional[Callable[[bool, str], None]] = None
-        self.on_connection_state: Optional[Callable[[str], None]] = None
+        # Connection-status change: emitted on every change to the connection
+        # lifecycle state OR the login flag (deduplicated). See connection_status().
+        #   on_connection_state(state: str, logged_in: bool)
+        self.on_connection_state: Optional[Callable[[str, bool], None]] = None
+        # Server clock sync (clientCmdSyncClock): the server reports its uptime in
+        # seconds on connect. NOTE the value is derived from simtime and thus
+        # tied to CPU speed, so it's approximate -- its main use is detecting a
+        # server restart (a sudden drop below the previous value).
+        #   on_sync_clock(uptime_seconds: float, received_at: float)
+        self.on_sync_clock: Optional[Callable[[float, float], None]] = None
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # --- Per-connection protocol stack (rebuilt on each reconnect) ---- #
+        self._build_protocol_stack()
+
+    def _build_protocol_stack(self) -> None:
+        """Construct the per-connection decode/event state.
+
+        Called from ``__init__`` and again from :meth:`reset` before a
+        reconnect, so a dropped connection's stale sequence numbers, mission
+        phase, roster, and login flags never leak into the next attempt. The
+        persistent public callbacks (assigned in ``__init__``) are left intact.
+        """
+        self.events = EventManager()
+        self.phases = GameConnectionPhases(
+            self.events,
+            skip_lighting=self.config.aot_skip_lighting,
+            track_objects=self.config.aot_track_objects,
+        )
+        self.conn: Optional[NetConnection] = None
+
+        # Online-player roster (fed by MsgClientJoin/Drop/ScoreChanged).
+        self.players = PlayerListRegistry()
+
         self._logged_in = False
         self._login_user: Optional[str] = None
         self._login_password: Optional[str] = None
@@ -197,6 +225,11 @@ class AotClient:
         self._register_pending = False
         self._register_name: Optional[str] = None
         self._register_overwrite = False
+        # Connection-status tracking. _conn_state is the current lifecycle string
+        # (see connection_status); _last_connection_emit dedupes the callback so
+        # we only fire on a genuine (state, logged_in) change.
+        self._conn_state = "disconnected"
+        self._last_connection_emit: Optional[tuple] = None
 
         # Wire EventManager -> connection send request.
         self.events.request_send = self._request_send
@@ -210,6 +243,16 @@ class AotClient:
         # clientCmdLoginSuccess (valid) or clientCmdWarningBox (bad creds /
         # missing character) once the full mission load completes.
         self.phases.on_phase2_acked = self._on_phase2_acked
+
+    def reset(self) -> None:
+        """Discard the previous connection's state so this client can reconnect.
+
+        Rebuilds the protocol stack in place (same ``AotClient`` instance), so
+        callers holding a reference — main.py's callback wiring, the REPL — keep
+        working across reconnects. Call this between a drop and the next
+        :meth:`connect`.
+        """
+        self._build_protocol_stack()
 
     # ------------------------------------------------------------------ #
     # Setup / teardown
@@ -228,6 +271,7 @@ class AotClient:
         ev.on_client_cmd("LoginSuccess", self._on_login_success)
         ev.on_client_cmd("WarningBox", self._on_warning_box)
         ev.on_client_cmd("ConfirmCharacterOverWrite", self._on_confirm_overwrite)
+        ev.on_client_cmd("SyncClock", self._on_sync_clock)
         ev.set_default_handler(self._on_unhandled_cmd)
 
     async def connect(self, timeout: float = 20.0) -> bool:
@@ -238,6 +282,9 @@ class AotClient:
         # Fresh session: drop any stale roster from a previous connection (the
         # server re-sends MsgClientJoin for everyone online as we load in).
         self.players.clear()
+        # Announce the attempt before the (potentially slow) host resolution +
+        # handshake, so consumers see `connecting` immediately.
+        self._set_connection("connecting")
         # Resolve the server host from the master server if none was configured.
         try:
             host = await self._resolve_server_host()
@@ -371,6 +418,7 @@ class AotClient:
     def logout(self) -> None:
         self.events.command_to_server("logout")
         self._logged_in = False
+        self._set_connection()
 
     def say(self, text: str) -> None:
         """Local/proximity chat: ``commandToServer('Talk', text)``."""
@@ -634,6 +682,22 @@ class AotClient:
         logger.error("new character: %s", msg)
         self._emit(self.on_login_result, False, msg)
 
+    def _on_sync_clock(self, args: list[str], evt: RemoteCommandEvent) -> None:
+        # clientCmdSyncClock(%time): the server reports its uptime in seconds
+        # (see ageoftime-bot base/skylord/serverTime.cs). Mirror that package by
+        # capturing the value alongside the local receive time. The uptime is
+        # derived from simtime (CPU-speed dependent), so it's only approximate --
+        # a sudden drop below the previous value signals a server restart.
+        raw = args[0] if args else ""
+        try:
+            uptime_seconds = float(raw)
+        except (ValueError, TypeError):
+            logger.warning("clientCmdSyncClock: unparseable uptime %r", raw)
+            return
+        received_at = time.time()
+        logger.info("server clock sync: uptime=%.0fs", uptime_seconds)
+        self._emit(self.on_sync_clock, uptime_seconds, received_at)
+
     def _on_unhandled_cmd(self, verb: str, args: list[str], evt: RemoteCommandEvent) -> None:
         logger.debug("unhandled clientCmd%s(%s)", verb, args)
 
@@ -643,6 +707,8 @@ class AotClient:
         self._logged_in = True
         logger.info("LOGGED IN (%s)", detail)
         self._emit(self.on_login_result, True, detail)
+        # Login flag flipped -> emit an updated connection status.
+        self._set_connection()
 
     # ------------------------------------------------------------------ #
     # State plumbing
@@ -653,13 +719,13 @@ class AotClient:
         # AoT client. Login is idempotent server-side here; the result arrives
         # later via clientCmdLoginSuccess / clientCmdWarningBox.
         logger.info("Phase2 acked -> eager login")
-        self._emit(self.on_connection_state, "ingame_loggedout")
+        self._set_connection("ingame_loggedout")
         if self.config.aot_username and self.config.aot_password:
             self.login()
 
     def _on_ingame(self) -> None:
         logger.info("reached in-game logged-out state")
-        self._emit(self.on_connection_state, "ingame_loggedout")
+        self._set_connection("ingame_loggedout")
         # Auto-login if credentials look real and we didn't already (eager path
         # at Phase2). Re-login here is harmless and matches the real client which
         # also re-sends login at MissionStart.
@@ -671,7 +737,43 @@ class AotClient:
             self.login()
 
     def _on_conn_state(self, state: ConnState) -> None:
-        self._emit(self.on_connection_state, state.value)
+        # A terminal transport state means we're no longer logged in; clear the
+        # flag first so the emitted status reports logged_in=false.
+        if state in (ConnState.DISCONNECTED, ConnState.TIMED_OUT, ConnState.REJECTED):
+            self._logged_in = False
+        self._set_connection(state.value)
+
+    def _set_connection(self, state: Optional[str] = None) -> None:
+        """Update the connection-status snapshot and emit on any real change.
+
+        ``state`` updates the lifecycle string (left unchanged when ``None``, so
+        a login-flag flip alone still emits). The callback fires only when the
+        (state, logged_in) pair differs from the last emitted one.
+        """
+        if state is not None:
+            self._conn_state = state
+        key = (self._conn_state, self._logged_in)
+        if key == self._last_connection_emit:
+            return
+        self._last_connection_emit = key
+        self._emit(self.on_connection_state, self._conn_state, self._logged_in)
+
+    def mark_reconnecting(self) -> None:
+        """Report the ``reconnecting`` lifecycle state.
+
+        Used by the auto-reconnect loop while it waits between attempts, so
+        consumers can distinguish "waiting to retry" from a plain disconnect.
+        """
+        self._logged_in = False
+        self._set_connection("reconnecting")
+
+    def connection_status(self) -> dict:
+        """Current connection status: lifecycle ``state`` + ``logged_in`` flag.
+
+        This is the same shape pushed via ``on_connection_state`` and is used to
+        answer on-demand ``connection_state`` queries from the bridges.
+        """
+        return {"state": self._conn_state, "logged_in": self._logged_in}
 
     def _emit(self, cb, *args) -> None:
         if cb is None:

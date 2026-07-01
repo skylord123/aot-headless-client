@@ -54,6 +54,13 @@ def _to_int(value: str, *, var: str) -> int:
         raise ConfigError(f"{var}={value!r} is not a valid integer.") from exc
 
 
+def _to_float(value: str, *, var: str) -> float:
+    try:
+        return float(value.strip())
+    except ValueError as exc:
+        raise ConfigError(f"{var}={value!r} is not a valid number.") from exc
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """Effective runtime configuration.
@@ -109,6 +116,12 @@ class Config:
     aot_create_face: str = ""         # 0=A,1=B
     aot_create_ears: str = ""         # 0=Human,1=Elf
     aot_create_glasses: str = ""      # 0=Off,1=On
+
+    # Auto-reconnect: when True, the bot retries the connection in a loop instead
+    # of exiting on disconnect. AUTO_RECONNECT_INTERVAL is the delay (seconds)
+    # between attempts. Default off => the process exits on disconnect as before.
+    auto_reconnect: bool = False
+    auto_reconnect_interval: float = 2.0
 
     # Behavior / debugging.
     log_level: str = "info"
@@ -191,6 +204,12 @@ class Config:
         create_user = _str2bool(
             env.get("AOT_CREATE_USER", "false"), var="AOT_CREATE_USER"
         )
+        auto_reconnect = _str2bool(
+            env.get("AUTO_RECONNECT", "false"), var="AUTO_RECONNECT"
+        )
+        auto_reconnect_interval = _to_float(
+            env.get("AUTO_RECONNECT_INTERVAL", "2.0"), var="AUTO_RECONNECT_INTERVAL"
+        )
         create_overwrite = _str2bool(
             env.get("AOT_CREATE_OVERWRITE", "false"), var="AOT_CREATE_OVERWRITE"
         )
@@ -208,6 +227,8 @@ class Config:
             nodered_port=nodered_port,
             websocket_host=websocket_host,
             websocket_port=websocket_port,
+            auto_reconnect=auto_reconnect,
+            auto_reconnect_interval=auto_reconnect_interval,
             aot_create_user=create_user,
             aot_create_overwrite=create_overwrite,
             aot_create_abilities=create_abilities,
@@ -260,6 +281,11 @@ class Config:
         if self.websocket_port is not None and not (0 < self.websocket_port < 65536):
             raise ConfigError(
                 f"WEBSOCKET_PORT must be in 1..65535, got {self.websocket_port}."
+            )
+        if self.auto_reconnect_interval < 0:
+            raise ConfigError(
+                f"AUTO_RECONNECT_INTERVAL must be >= 0, got "
+                f"{self.auto_reconnect_interval}."
             )
         valid_levels = {"debug", "info", "warning", "error", "critical"}
         if self.log_level not in valid_levels:

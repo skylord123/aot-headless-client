@@ -78,11 +78,12 @@ these specific verbs.
 | `disconnect`             | `[]`                         | Disconnect from the game server.                            |
 | `raw <verb> <args...>`   | `[verb, *args]`              | Arbitrary `commandToServer(verb, *args)` — escape hatch for any server command. |
 | `players`                | `[]`                         | Request the online roster. Replies with a `players` message. |
+| `connection_state`       | `[]`                         | Request the current connection status. Replies with a `connection_state` message (`state` + `logged_in`). |
 | `list_objects [all]`     | `[]` or `[all\|1\|true]`     | Request the tracked object list (with `all`/`1`/`true`, includes removed objects). Replies with `object_list`. |
 | `get_object <ghost_id>`  | `[ghost_id]`                 | Request one object by integer ghost id. Replies with `object` (`null` if missing/invalid). |
 
-The three `players` / `list_objects` / `get_object` query commands trigger a JSON
-reply — see [Outbound messages](#outbound-messages).
+The `players` / `connection_state` / `list_objects` / `get_object` query commands
+each trigger a JSON reply — see [Outbound messages](#outbound-messages).
 
 ### Parsing rules
 
@@ -93,8 +94,8 @@ reply — see [Outbound messages](#outbound-messages).
 - **All other verbs** — the remainder is tokenized with **shell-like quoting**
   (`shlex`), so multi-word arguments can be quoted. If the quoting is unbalanced,
   the parser falls back to a plain whitespace split (never raises).
-- Verbs that take no arguments (`logout`, `disconnect`, `players`) ignore any
-  extra tokens.
+- Verbs that take no arguments (`logout`, `disconnect`, `players`,
+  `connection_state`) ignore any extra tokens.
 - **Unknown verbs** are still parsed into a command and dispatched to the
   default handler (if any); otherwise the line is logged and ignored.
 
@@ -118,6 +119,9 @@ list_objects all
 
 get_object 1234
   -> verb="get_object"   args=["1234"]
+
+connection_state
+  -> verb="connection_state" args=[]
 
 disconnect
   -> verb="disconnect" args=[]
@@ -148,7 +152,63 @@ Emitted asynchronously as game state changes:
 | `player_dropped`   | `name`, `client_id` (int\|null), `message`, `associated_usernames` (array) | A client left the roster (`MsgClientDrop`). `message` is the chat-HUD line, e.g. `"<name> has left the game."`. `associated_usernames` is the full name history (captured before the client is removed). |
 | `zone_change`      | `player`, `zone`, `message`             | A player moved to a new world zone/region (`MsgClientScoreChanged`). `message` is `"<player> entered <zone>"`. Skipped for logged-out/connecting placeholders and unknown clients. |
 | `login_result`     | `success` (bool), `detail`              | Outcome of a login attempt.                      |
-| `connection_state` | `state`                                 | Connection lifecycle change (e.g. connecting/connected/disconnected). |
+| `connection_state` | `state` (str), `logged_in` (bool)       | Connection lifecycle / login change. Also requestable on demand — see [Connection state](#connection-state). |
+| `sync_clock`       | `uptime_seconds` (number), `received_at` (unix seconds) | Server-reported uptime, emitted on connect (`clientCmdSyncClock`). See note below. |
+
+#### Connection state
+
+`connection_state` reports the bot's own connection lifecycle plus its login
+status. It is **pushed on every change** to either field, and can also be
+**requested on demand** (send the `connection_state` command) — both use the
+same JSON shape:
+
+```json
+{"action": "connection_state", "state": "connected", "logged_in": false}
+```
+
+- **`state`** — the current lifecycle stage (string).
+- **`logged_in`** — whether the bot is logged into an account (bool), independent
+  of `state`: the bot reaches `ingame_loggedout` first and only flips
+  `logged_in` to `true` once the account login completes.
+
+A normal session walks the states **in this order**:
+
+| Order | `state`                        | Meaning                                                          |
+| ----- | ------------------------------ | ---------------------------------------------------------------- |
+| 1     | `connecting`                   | A connect attempt has started (host resolution + handshake).     |
+| 2     | `awaiting_challenge_response`  | Sent the connect challenge; waiting for the server's reply.      |
+| 3     | `awaiting_connect_response`    | Challenge solved; waiting for connect accept/reject.             |
+| 4     | `connected`                    | The UDP connection was accepted; mission load begins.            |
+| 5     | `ingame_loggedout`             | Reached the in-game logged-out state (ready to log in).          |
+| —     | `disconnected`                 | The connection ended cleanly / was dropped.                      |
+| —     | `timed_out`                    | The connection timed out (no response).                          |
+| —     | `rejected`                     | The server rejected the connect request.                         |
+| —     | `reconnecting`                 | Waiting to retry, only when `AUTO_RECONNECT` is enabled (below). |
+
+`logged_in` flips to `true` (while `state` stays `ingame_loggedout`) after a
+successful login, and back to `false` on logout or any disconnect. Consecutive
+identical `(state, logged_in)` pairs are de-duplicated, so you only receive an
+event on a genuine change.
+
+**Auto-reconnect.** By default the bot **exits** when the connection drops. Set
+`AUTO_RECONNECT=true` to instead retry in a loop, waiting
+`AUTO_RECONNECT_INTERVAL` seconds (default `2.0`) between attempts. While waiting
+it emits `connection_state` with `state: "reconnecting"`, then `connecting` again
+on the next attempt — so watching this event stream is how a consumer observes a
+server restart / reconnect cycle. (Both variables are read from the environment /
+`.env`; see `.env.example`.)
+
+On connect the server sends `clientCmdSyncClock(<uptime>)`, reporting its uptime
+in seconds. The bot forwards this as a **`sync_clock`** event carrying that
+`uptime_seconds` value and `received_at` — the unix timestamp (seconds) of when
+the bot received it, so a consumer can extrapolate the current uptime as
+`uptime_seconds + (now - received_at)`. This mirrors the in-engine
+`ServerRunTimePackage` (`base/skylord/serverTime.cs`). The uptime is derived from
+the server's simtime, which depends on the host CPU speed, so it is
+**approximate** — its primary use is **detecting a server restart**: when a new
+`sync_clock` reports an `uptime_seconds` that has suddenly **dropped below** the
+previous value, the server has restarted. The bot re-emits `sync_clock` each time
+it reconnects.
 
 The server multiplexes everything through one tagged `ServerMessage` command.
 The engine adds a chat-HUD line only when the message text is non-empty
@@ -180,6 +240,7 @@ Emitted in response to an inbound query command:
 | `action`      | In reply to    | Fields                          | Meaning                                            |
 | ------------- | -------------- | ------------------------------- | -------------------------------------------------- |
 | `players`     | `players`      | `players` (array)               | The online roster, each entry joined to its Player ghost. |
+| `connection_state` | `connection_state` | `state` (str), `logged_in` (bool) | The current connection status (same shape as the pushed event). |
 | `object_list` | `list_objects` | `objects` (array)               | The tracked object/ghost list.                     |
 | `object`      | `get_object`   | `object` (object \| `null`)     | One object; `null` when the ghost id is unknown or unparseable. |
 
@@ -194,7 +255,10 @@ One JSON object per line (terminator omitted for readability):
 {"action": "player_dropped", "name": "What's For Dinner", "client_id": 39570, "message": "What's For Dinner has left the game.", "associated_usernames": ["What's For Dinner"]}
 {"action": "zone_change", "player": "alice", "zone": "Port Town", "message": "alice entered Port Town"}
 {"action": "login_result", "success": true, "detail": "ok"}
-{"action": "connection_state", "state": "connected"}
+{"action": "connection_state", "state": "connected", "logged_in": false}
+{"action": "connection_state", "state": "ingame_loggedout", "logged_in": true}
+{"action": "connection_state", "state": "reconnecting", "logged_in": false}
+{"action": "sync_clock", "uptime_seconds": 86400.0, "received_at": 1751328000.123}
 {"action": "players", "players": [{"name": "alice", "client_id": 7, "object_id": 1234, "associated_usernames": ["alice"]}]}
 {"action": "object_list", "objects": [{"id": 1234, "class": "Player"}]}
 {"action": "object", "object": {"id": 1234, "class": "Player"}}

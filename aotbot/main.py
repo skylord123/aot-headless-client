@@ -166,8 +166,28 @@ async def _main(config: Config, interactive: bool = False) -> None:
     def on_login_result(success: bool, detail: str) -> None:
         forward({"action": "login_result", "success": success, "detail": detail})
 
-    def on_connection_state(state: str) -> None:
-        forward({"action": "connection_state", "state": state})
+    def on_connection_state(state: str, logged_in: bool) -> None:
+        # Emitted on every change to the connection lifecycle state OR the login
+        # flag. `state` walks: connecting -> awaiting_challenge_response ->
+        # awaiting_connect_response -> connected -> ingame_loggedout, then
+        # disconnected/timed_out/rejected (or reconnecting while retrying).
+        forward({
+            "action": "connection_state",
+            "state": state,
+            "logged_in": logged_in,
+        })
+
+    def on_sync_clock(uptime_seconds: float, received_at: float) -> None:
+        # Mirror ServerRunTimePackage (base/skylord/serverTime.cs): the server
+        # reports its uptime in seconds on connect. Forward the value plus the
+        # unix timestamp of when we received it. The uptime is simtime-derived
+        # (CPU-speed dependent) and thus approximate -- consumers use a sudden
+        # drop below the previous value to detect a server restart.
+        forward({
+            "action": "sync_clock",
+            "uptime_seconds": uptime_seconds,
+            "received_at": received_at,
+        })
 
     client.on_chat = on_chat
     client.on_server_message = on_server_message
@@ -176,6 +196,7 @@ async def _main(config: Config, interactive: bool = False) -> None:
     client.on_zone_change = on_zone_change
     client.on_login_result = on_login_result
     client.on_connection_state = on_connection_state
+    client.on_sync_clock = on_sync_clock
 
     # ---- inbound: action handlers (shared by both transports) ----------- #
     # The actual game-side behavior lives here, expressed against plain Python
@@ -224,6 +245,16 @@ async def _main(config: Config, interactive: bool = False) -> None:
         # joined_at as a unix timestamp).
         forward({"action": "players", "players": client.get_players()})
 
+    def act_connection() -> None:
+        # -> {"action":"connection_state","state":...,"logged_in":...} -- the
+        # current status, on demand. Same shape as the pushed event.
+        status = client.connection_status()
+        forward({
+            "action": "connection_state",
+            "state": status["state"],
+            "logged_in": status["logged_in"],
+        })
+
     def act_get_object(ghost_id) -> None:
         # -> {"action":"object","object":{...}|null}
         obj = None
@@ -252,6 +283,7 @@ async def _main(config: Config, interactive: bool = False) -> None:
             lambda c: act_list_objects(bool(c.args) and c.args[0].lower() in ("all", "1", "true")),
         )
         bridge.register_handler("players", lambda c: act_players())
+        bridge.register_handler("connection_state", lambda c: act_connection())
         bridge.register_handler("get_object", lambda c: act_get_object(c.args[0] if c.args else None))
         bridge.register_handler("disconnect", lambda c: act_disconnect())
 
@@ -278,6 +310,7 @@ async def _main(config: Config, interactive: bool = False) -> None:
         server.register_handler("raw", lambda m: act_raw(m.get("verb"), list(m.get("args") or [])))
         server.register_handler("list_objects", lambda m: act_list_objects(bool(m.get("all"))))
         server.register_handler("players", lambda m: act_players())
+        server.register_handler("connection_state", lambda m: act_connection())
         server.register_handler("get_object", lambda m: act_get_object(m.get("ghost_id")))
         server.register_handler("disconnect", lambda m: act_disconnect())
 
@@ -300,19 +333,13 @@ async def _main(config: Config, interactive: bool = False) -> None:
         if server is not None:
             await server.stop()
 
-    target = config.aot_server_host or f"(resolve via master server {config.aot_master_url})"
-    log.info("connecting to AoT server %s port %d", target, config.aot_server_port)
-    ok = await client.connect()
-    if not ok:
-        log.error("connection failed; shutting down")
-        await stop_transports()
-        return
-
     if not _has_credentials(config):
         log.warning("no credentials configured; staying logged out (decode-only)")
 
     # Optional interactive REPL (typed commands + tab-completion), running
-    # alongside the live bot. /quit (or Ctrl-D) sets `stop`.
+    # alongside the live bot. /quit (or Ctrl-D) sets `stop`. Started once and
+    # reused across reconnects (the client instance is stable; reset() rebuilds
+    # only its internal protocol stack, so this reference stays valid).
     repl_task: Optional[asyncio.Task] = None
     if interactive:
         try:
@@ -321,13 +348,46 @@ async def _main(config: Config, interactive: bool = False) -> None:
         except Exception:  # noqa: BLE001 - never let REPL setup kill the bot
             log.exception("interactive REPL unavailable; continuing headless")
 
-    # Run until interrupted, /quit, or the connection drops.
+    target = config.aot_server_host or f"(resolve via master server {config.aot_master_url})"
+
+    # Connect -> run-until-drop, optionally looping on AUTO_RECONNECT. With
+    # auto-reconnect off, this runs exactly once (exit on the first drop/failure,
+    # matching the prior behavior).
     try:
         while not stop.is_set():
-            if client.conn is None or not client.conn.is_connected:
-                log.info("connection closed; exiting")
+            log.info("connecting to AoT server %s port %d", target, config.aot_server_port)
+            ok = await client.connect()
+            if ok:
+                # Run until interrupted, /quit, or the connection drops.
+                while not stop.is_set():
+                    if client.conn is None or not client.conn.is_connected:
+                        log.info("connection closed")
+                        break
+                    await asyncio.wait([asyncio.create_task(stop.wait())], timeout=1.0)
+            else:
+                log.error("connection failed")
+
+            if stop.is_set():
                 break
-            await asyncio.wait([asyncio.create_task(stop.wait())], timeout=1.0)
+            if not config.auto_reconnect:
+                log.info("auto-reconnect disabled; exiting")
+                break
+
+            # Tear down this attempt (closes the transport), announce the retry,
+            # then wait AUTO_RECONNECT_INTERVAL -- interruptible by shutdown.
+            await client.disconnect("reconnecting")
+            client.mark_reconnecting()
+            log.info("reconnecting in %.1fs", config.auto_reconnect_interval)
+            try:
+                await asyncio.wait_for(
+                    stop.wait(), timeout=config.auto_reconnect_interval
+                )
+            except asyncio.TimeoutError:
+                pass
+            if stop.is_set():
+                break
+            # Fresh protocol stack for the next attempt.
+            client.reset()
     finally:
         if repl_task is not None:
             repl_task.cancel()

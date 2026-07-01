@@ -278,3 +278,29 @@ def test_override_revalidates():
 def test_unknown_override_raises():
     with pytest.raises(ConfigError):
         Config.load(env=REQUIRED, overrides={"bogus_field": "x"})
+
+
+# --- Auto-reconnect -------------------------------------------------------
+
+
+def test_auto_reconnect_defaults_off():
+    cfg = _load_from(CREDS_ONLY)
+    assert cfg.auto_reconnect is False
+    assert cfg.auto_reconnect_interval == 2.0
+
+
+def test_auto_reconnect_parsed():
+    cfg = _load_from({**CREDS_ONLY, "AUTO_RECONNECT": "true",
+                      "AUTO_RECONNECT_INTERVAL": "0.5"})
+    assert cfg.auto_reconnect is True
+    assert cfg.auto_reconnect_interval == 0.5
+
+
+def test_auto_reconnect_interval_invalid_number_raises():
+    with pytest.raises(ConfigError):
+        _load_from({**CREDS_ONLY, "AUTO_RECONNECT_INTERVAL": "soon"})
+
+
+def test_auto_reconnect_interval_negative_raises():
+    with pytest.raises(ConfigError):
+        _load_from({**CREDS_ONLY, "AUTO_RECONNECT_INTERVAL": "-1"})

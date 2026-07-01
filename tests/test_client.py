@@ -355,3 +355,88 @@ def test_register_uses_config_appearance_and_randomizes_blanks():
     assert a[2] == 1 and a[8] == 3 and a[11] == 4   # gender, skin, hairColor (fixed)
     assert a[9] >= 3                                 # lipTone clamped >= skinTone
     assert a[13] in (0, 1) and a[15] in (0, 1)       # face(-1) / glasses(bad) -> random
+
+
+# --------------------------------------------------------------------------- #
+# Connection status (state + logged_in) + reset()
+# --------------------------------------------------------------------------- #
+
+
+def test_connection_status_defaults_disconnected_loggedout():
+    client = AotClient(_cfg())
+    assert client.connection_status() == {"state": "disconnected", "logged_in": False}
+
+
+def test_login_success_emits_connection_status_change():
+    # LoginSuccess flips the login flag; the connection-status callback fires with
+    # the unchanged state and logged_in=True.
+    client = AotClient(_cfg())
+    events = []
+    client.on_connection_state = lambda state, logged_in: events.append((state, logged_in))
+    client._login_user = "bot"
+    _feed_command(client, "LoginSuccess")
+    assert client.connection_status() == {"state": "disconnected", "logged_in": True}
+    assert events == [("disconnected", True)]
+
+
+def test_connection_status_dedupes_repeat_emits():
+    client = AotClient(_cfg())
+    events = []
+    client.on_connection_state = lambda state, logged_in: events.append((state, logged_in))
+    client._set_connection("connecting")
+    client._set_connection("connecting")  # identical -> suppressed
+    client._set_connection("connected")
+    assert events == [("connecting", False), ("connected", False)]
+
+
+def test_mark_reconnecting_reports_state_and_clears_login():
+    client = AotClient(_cfg())
+    client._logged_in = True
+    events = []
+    client.on_connection_state = lambda state, logged_in: events.append((state, logged_in))
+    client.mark_reconnecting()
+    assert client.connection_status() == {"state": "reconnecting", "logged_in": False}
+    assert events == [("reconnecting", False)]
+
+
+def test_reset_rebuilds_fresh_protocol_stack():
+    client = AotClient(_cfg())
+    # Dirty the per-connection state.
+    client._logged_in = True
+    client._login_user = "bot"
+    client._set_connection("connected")
+    old_events, old_phases = client.events, client.phases
+    client.reset()
+    assert client.connection_status() == {"state": "disconnected", "logged_in": False}
+    assert client._login_user is None
+    assert client.events is not old_events
+    assert client.phases is not old_phases
+    # Public callbacks survive a reset.
+    marker = lambda *a: None
+    client.on_chat = marker
+    client.reset()
+    assert client.on_chat is marker
+
+
+# --------------------------------------------------------------------------- #
+# Server clock sync (clientCmdSyncClock)
+# --------------------------------------------------------------------------- #
+
+
+def test_sync_clock_emits_uptime_and_receive_time():
+    client = AotClient(_cfg())
+    got = []
+    client.on_sync_clock = lambda uptime, received_at: got.append((uptime, received_at))
+    _feed_command(client, "SyncClock", "86400")
+    assert len(got) == 1
+    uptime, received_at = got[0]
+    assert uptime == 86400.0
+    assert received_at > 0
+
+
+def test_sync_clock_ignores_unparseable_value():
+    client = AotClient(_cfg())
+    got = []
+    client.on_sync_clock = lambda uptime, received_at: got.append((uptime, received_at))
+    _feed_command(client, "SyncClock", "not-a-number")
+    assert got == []
