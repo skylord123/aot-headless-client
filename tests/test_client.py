@@ -440,3 +440,26 @@ def test_sync_clock_ignores_unparseable_value():
     client.on_sync_clock = lambda uptime, received_at: got.append((uptime, received_at))
     _feed_command(client, "SyncClock", "not-a-number")
     assert got == []
+
+
+def test_sync_clock_status_defaults_to_nulls():
+    client = AotClient(_cfg())
+    assert client.sync_clock_status() == {"uptime_seconds": None, "received_at": None}
+
+
+def test_sync_clock_status_returns_last_value():
+    client = AotClient(_cfg())
+    _feed_command(client, "SyncClock", "3600")
+    status = client.sync_clock_status()
+    assert status["uptime_seconds"] == 3600.0
+    assert status["received_at"] > 0
+    # A second sync replaces the stored value.
+    _feed_command(client, "SyncClock", "120")
+    assert client.sync_clock_status()["uptime_seconds"] == 120.0
+
+
+def test_sync_clock_status_survives_reset():
+    client = AotClient(_cfg())
+    _feed_command(client, "SyncClock", "999")
+    client.reset()
+    assert client.sync_clock_status()["uptime_seconds"] == 999.0

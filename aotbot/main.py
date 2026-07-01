@@ -255,6 +255,12 @@ async def _main(config: Config, interactive: bool = False) -> None:
             "logged_in": status["logged_in"],
         })
 
+    def act_sync_clock() -> None:
+        # -> {"action":"sync_clock","uptime_seconds":...,"received_at":...} -- the
+        # last server clock sync (nulls if none received yet). Same shape as the
+        # pushed event.
+        forward({"action": "sync_clock", **client.sync_clock_status()})
+
     def act_get_object(ghost_id) -> None:
         # -> {"action":"object","object":{...}|null}
         obj = None
@@ -284,6 +290,7 @@ async def _main(config: Config, interactive: bool = False) -> None:
         )
         bridge.register_handler("players", lambda c: act_players())
         bridge.register_handler("connection_state", lambda c: act_connection())
+        bridge.register_handler("sync_clock", lambda c: act_sync_clock())
         bridge.register_handler("get_object", lambda c: act_get_object(c.args[0] if c.args else None))
         bridge.register_handler("disconnect", lambda c: act_disconnect())
 
@@ -311,6 +318,7 @@ async def _main(config: Config, interactive: bool = False) -> None:
         server.register_handler("list_objects", lambda m: act_list_objects(bool(m.get("all"))))
         server.register_handler("players", lambda m: act_players())
         server.register_handler("connection_state", lambda m: act_connection())
+        server.register_handler("sync_clock", lambda m: act_sync_clock())
         server.register_handler("get_object", lambda m: act_get_object(m.get("ghost_id")))
         server.register_handler("disconnect", lambda m: act_disconnect())
 

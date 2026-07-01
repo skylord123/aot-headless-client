@@ -86,11 +86,12 @@ selects the handler; the remaining fields are action-specific. The `action` is
 | `raw`          | `verb` (str), `args` (array, optional)  | Arbitrary `commandToServer(verb, *args)` — escape hatch for any server command. |
 | `players`      | —                                       | Request the online roster. Replies with a `players` message. |
 | `connection_state` | —                                   | Request the current connection status. Replies with a `connection_state` message (`state` + `logged_in`). |
+| `sync_clock`   | —                                       | Request the last server clock sync. Replies with a `sync_clock` message (nulls if none received yet). |
 | `list_objects` | `all` (bool, optional)                  | Request the tracked object list. With `all: true`, includes removed objects. Replies with `object_list`. |
 | `get_object`   | `ghost_id` (int)                        | Request one object by integer ghost id. Replies with `object` (`null` if missing/invalid). |
 
-The `players` / `connection_state` / `list_objects` / `get_object` requests each
-trigger a JSON reply broadcast to all connected clients — see
+The `players` / `connection_state` / `sync_clock` / `list_objects` / `get_object`
+requests each trigger a JSON reply broadcast to all connected clients — see
 [Outbound messages](#outbound-messages).
 
 ### Inbound examples
@@ -110,6 +111,7 @@ One JSON object per WebSocket text frame:
 {"action": "raw", "verb": "Talk", "args": ["hello world", 42]}
 {"action": "players"}
 {"action": "connection_state"}
+{"action": "sync_clock"}
 {"action": "list_objects", "all": true}
 {"action": "get_object", "ghost_id": 1234}
 ```
@@ -189,6 +191,11 @@ of when the bot received it, so a consumer can extrapolate the current uptime
 as `uptime_seconds + (now - received_at)`. This mirrors the in-engine
 `ServerRunTimePackage` (`base/skylord/serverTime.cs`).
 
+The bot also **remembers the last value** received, so a client can request it
+on demand by sending `{"action": "sync_clock"}` (see
+[Inbound messages](#inbound-messages)); the reply uses the same shape, with both
+fields `null` if no sync has been received yet.
+
 > **Accuracy caveat:** the uptime is derived from the server's simtime, which is
 > affected by the host CPU speed, so it is **approximate** — close, but not an
 > exact wall-clock value. Its primary use is **detecting a server restart**: when
@@ -241,6 +248,7 @@ Emitted in response to an inbound request:
 | ------------- | -------------- | ------------------------------- | -------------------------------------------------- |
 | `players`     | `players`      | `players` (array)               | The online roster, each entry joined to its Player ghost. |
 | `connection_state` | `connection_state` | `state` (str), `logged_in` (bool) | The current connection status (same shape as the pushed event). |
+| `sync_clock`  | `sync_clock`   | `uptime_seconds` (number\|null), `received_at` (unix seconds\|null) | The last server clock sync; nulls if none received yet. |
 | `object_list` | `list_objects` | `objects` (array)               | The tracked object/ghost list.                     |
 | `object`      | `get_object`   | `object` (object \| `null`)     | One object; `null` when the ghost id is unknown or unparseable. |
 

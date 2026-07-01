@@ -196,6 +196,11 @@ class AotClient:
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # Last server clock sync received (see _on_sync_clock). Kept here (not in
+        # the per-connection stack) so a client can query the most recent value
+        # even across reconnects; it's refreshed on every connect.
+        self._last_sync_clock: Optional[dict] = None
+
         # --- Per-connection protocol stack (rebuilt on each reconnect) ---- #
         self._build_protocol_stack()
 
@@ -696,7 +701,22 @@ class AotClient:
             return
         received_at = time.time()
         logger.info("server clock sync: uptime=%.0fs", uptime_seconds)
+        # Remember the latest value so it can be queried on demand.
+        self._last_sync_clock = {
+            "uptime_seconds": uptime_seconds,
+            "received_at": received_at,
+        }
         self._emit(self.on_sync_clock, uptime_seconds, received_at)
+
+    def sync_clock_status(self) -> dict:
+        """The most recent server clock sync, or nulls if none received yet.
+
+        Shape matches the pushed ``sync_clock`` event
+        (``uptime_seconds`` + ``received_at``). See :meth:`_on_sync_clock`.
+        """
+        if self._last_sync_clock is None:
+            return {"uptime_seconds": None, "received_at": None}
+        return dict(self._last_sync_clock)
 
     def _on_unhandled_cmd(self, verb: str, args: list[str], evt: RemoteCommandEvent) -> None:
         logger.debug("unhandled clientCmd%s(%s)", verb, args)

@@ -79,11 +79,13 @@ these specific verbs.
 | `raw <verb> <args...>`   | `[verb, *args]`              | Arbitrary `commandToServer(verb, *args)` — escape hatch for any server command. |
 | `players`                | `[]`                         | Request the online roster. Replies with a `players` message. |
 | `connection_state`       | `[]`                         | Request the current connection status. Replies with a `connection_state` message (`state` + `logged_in`). |
+| `sync_clock`             | `[]`                         | Request the last server clock sync. Replies with a `sync_clock` message (nulls if none received yet). |
 | `list_objects [all]`     | `[]` or `[all\|1\|true]`     | Request the tracked object list (with `all`/`1`/`true`, includes removed objects). Replies with `object_list`. |
 | `get_object <ghost_id>`  | `[ghost_id]`                 | Request one object by integer ghost id. Replies with `object` (`null` if missing/invalid). |
 
-The `players` / `connection_state` / `list_objects` / `get_object` query commands
-each trigger a JSON reply — see [Outbound messages](#outbound-messages).
+The `players` / `connection_state` / `sync_clock` / `list_objects` / `get_object`
+query commands each trigger a JSON reply — see
+[Outbound messages](#outbound-messages).
 
 ### Parsing rules
 
@@ -95,7 +97,7 @@ each trigger a JSON reply — see [Outbound messages](#outbound-messages).
   (`shlex`), so multi-word arguments can be quoted. If the quoting is unbalanced,
   the parser falls back to a plain whitespace split (never raises).
 - Verbs that take no arguments (`logout`, `disconnect`, `players`,
-  `connection_state`) ignore any extra tokens.
+  `connection_state`, `sync_clock`) ignore any extra tokens.
 - **Unknown verbs** are still parsed into a command and dispatched to the
   default handler (if any); otherwise the line is logged and ignored.
 
@@ -122,6 +124,9 @@ get_object 1234
 
 connection_state
   -> verb="connection_state" args=[]
+
+sync_clock
+  -> verb="sync_clock" args=[]
 
 disconnect
   -> verb="disconnect" args=[]
@@ -208,7 +213,8 @@ the server's simtime, which depends on the host CPU speed, so it is
 **approximate** — its primary use is **detecting a server restart**: when a new
 `sync_clock` reports an `uptime_seconds` that has suddenly **dropped below** the
 previous value, the server has restarted. The bot re-emits `sync_clock` each time
-it reconnects.
+it reconnects. The last value is also **remembered** and can be requested on
+demand with the `sync_clock` command (nulls if none received yet).
 
 The server multiplexes everything through one tagged `ServerMessage` command.
 The engine adds a chat-HUD line only when the message text is non-empty
@@ -241,6 +247,7 @@ Emitted in response to an inbound query command:
 | ------------- | -------------- | ------------------------------- | -------------------------------------------------- |
 | `players`     | `players`      | `players` (array)               | The online roster, each entry joined to its Player ghost. |
 | `connection_state` | `connection_state` | `state` (str), `logged_in` (bool) | The current connection status (same shape as the pushed event). |
+| `sync_clock`  | `sync_clock`   | `uptime_seconds` (number\|null), `received_at` (unix seconds\|null) | The last server clock sync; nulls if none received yet. |
 | `object_list` | `list_objects` | `objects` (array)               | The tracked object/ghost list.                     |
 | `object`      | `get_object`   | `object` (object \| `null`)     | One object; `null` when the ghost id is unknown or unparseable. |
 
