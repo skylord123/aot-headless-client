@@ -235,6 +235,18 @@ class AotClient:
         # we only fire on a genuine (state, logged_in) change.
         self._conn_state = "disconnected"
         self._last_connection_emit: Optional[tuple] = None
+        # Set once a fatal event-stream desync starts teardown, so the packets
+        # still arriving mid-teardown don't spawn duplicate disconnect tasks.
+        # Rebuilt (False) on every reset()/reconnect.
+        self._desync_abort_started = False
+        # True while auto-login is waiting for our username to free up: after a
+        # crash+reconnect the PREVIOUS session's character can still be in-world
+        # (the server hasn't timed the dead connection out yet), so logging in
+        # would be rejected. We stay logged out and retry on every roster
+        # change until the ghost session drops. Mirrors the in-game bot's
+        # autoBotLogin() isInList(user, getPlayerNames(true)) wait loop
+        # (base/skylord/bot/login.cs).
+        self._login_deferred = False
 
         # Wire EventManager -> connection send request.
         self.events.request_send = self._request_send
@@ -349,8 +361,20 @@ class AotClient:
         try:
             self.phases.read_packet_body(bs)
         except AlignmentError as exc:
-            # Past this point the bitstream is undecodable; log once per packet.
-            logger.warning("packet body alignment limit: %s", exc)
+            if exc.fatal:
+                # The guaranteed-ordered event stream lost data the server
+                # believes was delivered (the packet is ACKed regardless).
+                # From here the string table / ghost table / phase state
+                # silently diverge and every later "decoded" event is suspect
+                # garbage -- the connection looks alive but chat/roster events
+                # stop flowing. Drop it so auto-reconnect builds a fresh
+                # session instead of zombie-ing.
+                self._on_fatal_desync(exc)
+            else:
+                # Ghost-section loss: the event section was already consumed,
+                # so only this packet's ghost updates are dropped. Log and
+                # carry on.
+                logger.warning("packet body alignment limit: %s", exc)
         finally:
             # After each received packet, check whether the ghost-always burst has
             # finished; if so, reply ReadyForNormalGhosts to unblock the server's
@@ -358,6 +382,26 @@ class AotClient:
             # GhostAlwaysDone to a headless client). This is what lets the full
             # load complete -> Phase3 -> MissionStart -> the login response.
             self.phases.maybe_send_ready_for_normal_ghosts()
+
+    def _on_fatal_desync(self, exc: AlignmentError) -> None:
+        """Tear the connection down after an unrecoverable event-stream desync.
+
+        Called from inside the receive path (sync context), so the actual
+        disconnect runs as a task; main.py's run loop then sees is_connected go
+        false and reconnects (when AUTO_RECONNECT is on). Guarded so the
+        packets that keep arriving while teardown is in flight don't spawn
+        duplicate disconnects.
+        """
+        if self._desync_abort_started:
+            return
+        self._desync_abort_started = True
+        logger.error(
+            "unrecoverable event-stream desync (%s); "
+            "dropping connection to force a clean reconnect",
+            exc,
+        )
+        if self.conn is not None:
+            asyncio.create_task(self.conn.disconnect("event stream desync"))
 
     async def disconnect(self, reason: str = "Done") -> None:
         if self.conn is not None:
@@ -409,6 +453,52 @@ class AotClient:
         ``joined_at`` is a unix timestamp. Object fields need AOT_TRACK_OBJECTS.
         """
         return match_player_objects(self.players.list(), self.list_objects())
+
+    def username_online(self, user: Optional[str] = None) -> bool:
+        """True when a roster entry is CURRENTLY using ``user`` as its name.
+
+        Matches the in-game bot's pre-login check (login.cs autoBotLogin ->
+        isInList(user, getPlayerNames(true))): current names only -- a client
+        that used the name earlier but has since logged out does not hold it --
+        with the ``<Logged Out>``/``<Connecting>`` placeholders skipped, and
+        case-insensitively (Torque name matching is case-insensitive).
+        """
+        u = (user if user is not None else self.config.aot_username).strip().lower()
+        if not u:
+            return False
+        for p in self.players.list():
+            name = p.name.strip()
+            if name.startswith("<"):
+                continue  # logged-out/connecting placeholder, not a held name
+            if name.lower() == u:
+                return True
+        return False
+
+    def _maybe_auto_login(self) -> None:
+        """Auto-login -- unless our username is already in-world.
+
+        If a previous session's character is still online (crashed bot whose
+        connection the server hasn't dropped yet), stay logged out and mark the
+        login deferred; every subsequent roster change re-runs this until the
+        name frees up.
+        """
+        if self._logged_in:
+            return
+        user = self.config.aot_username
+        if not (user and self.config.aot_password):
+            return
+        if self.username_online(user):
+            if not self._login_deferred:
+                logger.warning(
+                    "%r is already online (previous session still connected?); "
+                    "deferring login until it drops", user,
+                )
+                self._login_deferred = True
+            return
+        if self._login_deferred:
+            self._login_deferred = False
+            logger.info("%r is no longer online -> logging in now", user)
+        self.login()
 
     def login(self, user: Optional[str] = None, password: Optional[str] = None) -> None:
         """Send ``commandToServer('login', user, getStringCRC(pass))``."""
@@ -642,6 +732,13 @@ class AotClient:
             and text.strip() == f"{self._login_user} logged in."
         ):
             self._mark_logged_in("server message broadcast")
+            return
+
+        # A deferred auto-login retries on every roster change: the ghost
+        # session holding our name can free it by dropping (MsgClientDrop) or
+        # by re-logging as another character (a MsgClientJoin rename).
+        if self._login_deferred and tag in ("MsgClientJoin", "MsgClientDrop"):
+            self._maybe_auto_login()
 
     def _on_login_success(self, args: list[str], evt: RemoteCommandEvent) -> None:
         logger.info("clientCmdLoginSuccess")
@@ -670,6 +767,16 @@ class AotClient:
             )
             self.register_new_user()
             return
+        # Server-side rejection because the character is in use (we can race
+        # the roster sync: our check saw the name free but the ghost session
+        # was still connected server-side). Arm the deferred-login wait so the
+        # next roster drop retries automatically.
+        if not self._logged_in and "already logged in" in warn_text.lower():
+            logger.warning(
+                "server says the character is already logged in; "
+                "deferring login until it drops"
+            )
+            self._login_deferred = True
         if not self._logged_in:
             self._emit(self.on_login_result, False, warn_text)
 
@@ -725,7 +832,15 @@ class AotClient:
         if self._logged_in:
             return
         self._logged_in = True
+        self._login_deferred = False
         logger.info("LOGGED IN (%s)", detail)
+        # Detach the camera at our player: the server then ghosts us ALL
+        # objects regardless of distance (mirrors cameraHack.cs
+        # startCameraFly's commandToServer('dropCameraAtPlayer')), so the
+        # roster/object telemetry sees the whole world, not just our scope
+        # bubble.
+        logger.info("requesting whole-world scope (dropCameraAtPlayer)")
+        self.events.command_to_server("dropCameraAtPlayer")
         self._emit(self.on_login_result, True, detail)
         # Login flag flipped -> emit an updated connection status.
         self._set_connection()
@@ -740,21 +855,16 @@ class AotClient:
         # later via clientCmdLoginSuccess / clientCmdWarningBox.
         logger.info("Phase2 acked -> eager login")
         self._set_connection("ingame_loggedout")
-        if self.config.aot_username and self.config.aot_password:
-            self.login()
+        self._maybe_auto_login()
 
     def _on_ingame(self) -> None:
         logger.info("reached in-game logged-out state")
         self._set_connection("ingame_loggedout")
         # Auto-login if credentials look real and we didn't already (eager path
         # at Phase2). Re-login here is harmless and matches the real client which
-        # also re-sends login at MissionStart.
-        if (
-            not self._logged_in
-            and self.config.aot_username
-            and self.config.aot_password
-        ):
-            self.login()
+        # also re-sends login at MissionStart. Held while our username is still
+        # in-world from a previous session (see _maybe_auto_login).
+        self._maybe_auto_login()
 
     def _on_conn_state(self, state: ConnState) -> None:
         # A terminal transport state means we're no longer logged in; clear the

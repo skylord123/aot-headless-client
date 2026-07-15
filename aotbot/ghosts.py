@@ -570,15 +570,20 @@ def _unpack_fx_grass_replicator(bs: BitStream, is_new: bool) -> None:
     bs.read_string()                  # (0x4a9ee4)
     for _ in range(8):
         bs.read_bytes(4)              # (0x4a9efa..0x4a9fa2)
-    bs.read_bytes(1)                  # read(1) byte (0x4a9fb9)
-    bs.read_flag()                    # flag (0x4a9fc6)
-    bs.read_bytes(1)                  # read(1) byte (0x4a9fd9)
-    bs.read_flag()                    # flag (0x4a9fe6)
-    bs.read_bytes(4)                  # (0x4a9ffa)
-    bs.read_bytes(1)                  # read(1) byte (0x4aa011)
-    bs.read_flag()                    # flag (0x4aa01e)
-    bs.read_bytes(1)                  # read(1) byte (0x4aa031)
-    bs.read_flag()                    # flag (0x4aa03e)
+    # RE-DISASSEMBLED (reverts the WAVE-11 flag additions, which were the
+    # over-read): the ``setne cl`` at 0x4a9fc6/0x4a9fe6/0x4aa01e/0x4aa03e is
+    # only the byte->bool CONVERSION of the byte just read by the preceding
+    # ``read(1)`` (``mov al,[esp+0x64]; test al,al; setne cl`` -- no bounds
+    # check, no bit-cursor advance). A genuine inline readFlag increments the
+    # stream cursor (``inc eax; mov [esi+0xc],eax``, e.g. @0x4aa112) -- these
+    # do not. The four phantom 1-bit reads over-consumed 4 bits per
+    # fxGrassReplicator (capture-validated boundary: next ghost-always event
+    # starts 4 bits before where the old decode ended).
+    bs.read_bytes(1)                  # read(1) byte -> bool [+0x394] (0x4a9fb9)
+    bs.read_bytes(1)                  # read(1) byte -> bool [+0x395] (0x4a9fd9)
+    bs.read_bytes(4)                  # [+0x398] (0x4a9ffa)
+    bs.read_bytes(1)                  # read(1) byte -> bool [+0x39c] (0x4aa011)
+    bs.read_bytes(1)                  # read(1) byte -> bool [+0x39d] (0x4aa031)
     for _ in range(7):
         bs.read_bytes(4)              # (0x4aa052..0x4aa0e2)
     bs.read_flag()                    # (0x4aa112)
@@ -1287,21 +1292,53 @@ def _unpack_camera(bs: BitStream, is_new: bool) -> None:
 
 
 def _unpack_item(bs: BitStream, is_new: bool) -> None:
-    """Item::unpackUpdate (AoT @ VA 0x45e5f0): ShapeBase parent, then a flag
-    (@0x45e643): if set -> 3 flags; a rotation while-loop
-    (``while readFlag(): readPoint3F()``); a flag; read(4); readString."""
+    """Item::unpackUpdate (AoT @ VA 0x45e5f0): ShapeBase parent, then FOUR
+    top-level flag-gated blocks (RE-DISASSEMBLED 0x45e5f0..0x45ed3a -- the old
+    transcription stopped after block 1, dropping blocks 2-4 entirely; block 4
+    is the position/velocity update sent for every DROPPED or MOVING item, so
+    any item toss/drop near the bot silently shredded the rest of the packet's
+    ghost section):
+
+      1. flag (@0x45e641): 3 bare flags; flag (bit test @0x45e723): if set
+         readPoint3F -> [+0x11c] (rotation axis; defaults 1,1,1 @0x45e6fc when
+         clear -- NOT a while-loop: the set-path ``jmp 0x45e713`` lands on the
+         NEXT field's bounds check, there is no back-edge to the flag); flag
+         (bit test @0x45e759, bool -> +/-1.0 @0x45e779); read(4) (@0x45e7b5);
+         readString (@0x45e7fb).
+      2. flag (@0x45e80c): if set readInt(14)      (mount ghost id, push 0xe
+                                                    @0x45e844).
+      3. flag (@0x45e89a): if set -> inline flag (@0x45e8cf, a bool the engine
+         maps to +/-1.0) + read(4)                 (@0x45e932, rotation speed).
+      4. flag (@0x45e977): if set ->
+           readPoint3F                             (position, @0x45e9b3);
+           flag atRest (@0x45e9f6): if CLEAR readPoint3F (velocity, @0x45ea38);
+           flag (@0x45ea48)                        (no payload; gates
+                                                    client-side interpolation
+                                                    math only, 0x45ea8a+).
+    """
     _unpack_shape_base(bs, is_new)
-    if bs.read_flag():            # (0x45e643)
+    if bs.read_flag():            # block 1 (0x45e643)
         bs.read_flag()            # (0x45e677) +0xaa6
         bs.read_flag()            # (0x45e6ad) +0xaa5
         bs.read_flag()            # (0x45e6e3) +0xaa4
-        # rotation while-loop (0x45e713..0x45e757): read a flag each iteration;
-        # if set read a Point3F and repeat; a clear flag ends the loop.
-        while bs.read_flag():     # (0x45e73c)
-            _read_point3f(bs)     # (0x45e74f)
-        bs.read_flag()            # (0x45e772)
+        # Single flag-gated rotation-axis Point3F (RE-DISASSEMBLED; the old
+        # while-loop transcription read a phantom "loop exit" flag after the
+        # point, desyncing by 1 bit whenever an item carried a rotation axis).
+        if bs.read_flag():        # (bit test 0x45e723)
+            _read_point3f(bs)     # rotation axis [+0x11c] (0x45e74f)
+        bs.read_flag()            # rotate-direction bool -> +/-1.0 (0x45e759)
         bs.read_bytes(4)          # read(4) (0x45e7b5)
         bs.read_string()          # readString (0x45e7fb)
+    if bs.read_flag():            # block 2 (0x45e80c)
+        bs.read_int(14)           # mount ghost id (0x45e844)
+    if bs.read_flag():            # block 3 (0x45e89a)
+        bs.read_flag()            # rotate direction bool (0x45e8cf)
+        bs.read_bytes(4)          # rotation speed F32 (0x45e932)
+    if bs.read_flag():            # block 4 (0x45e977) -- position/velocity
+        telemetry.emit_point3f("position", _read_point3f(bs))  # (0x45e9b3)
+        if not bs.read_flag():    # atRest (0x45e9f6); clear -> velocity follows
+            _read_point3f(bs)     # velocity (0x45ea38)
+        bs.read_flag()            # interpolation gate, no payload (0x45ea48)
 
 
 def _unpack_projectile(bs: BitStream, is_new: bool) -> None:

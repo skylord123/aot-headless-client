@@ -357,13 +357,15 @@ def test_sim2d_audio_event_decode():
 
 
 def test_sim3d_audio_event_full_precision_point():
-    """Sim3DAudioEvent::unpack (VA 0x45a6b0): readInt(10) id + compressed point.
+    """Sim3DAudioEvent::unpack (VA 0x45a6b0): readInt(10) id + transform flag
+    + compressed point.
 
-    With point type 3 the point is 3 raw F32 (96 bits).
+    Transform flag clear (no quat); point type 3 = 3 raw F32 (96 bits).
     """
     em = EventManager()
     bs = BitStream()
     bs.write_int(161, 10)        # datablock id
+    bs.write_flag(False)         # transform absent (bit test @0x45a763)
     bs.write_int(3, 2)           # compressed-point type 3 (full)
     bs.write_bytes(b"\x00" * 12)  # 3 x F32
     bs.write_int(0b101, 3)       # sentinel
@@ -372,12 +374,18 @@ def test_sim3d_audio_event_full_precision_point():
     assert rs.read_int(3) == 0b101
 
 
-def test_sim3d_audio_event_quantised_point():
-    """Compressed point types 0/1/2 read 3 x readSignedInt(gBitCounts[type])."""
+def test_sim3d_audio_event_quantised_point_with_transform():
+    """With the transform flag SET the event carries a compressed quaternion
+    (3 x readFloat(8) + w-sign flag) before the compressed point; point types
+    0/1/2 read 3 x readSignedInt(gBitCounts[type])."""
     em = EventManager()
     bs = BitStream()
     bs.write_int(5, 10)          # datablock id
-    bs.write_int(0, 2)           # type 0 -> 16-bit signed each (sign + 15 mag)
+    bs.write_flag(True)          # transform present
+    for _ in range(3):
+        bs.write_int(100, 8)     # quat x/y/z (readFloat(8))
+    bs.write_flag(True)          # quat w sign
+    bs.write_int(0, 2)           # point type 0 -> 16-bit signed each
     for _ in range(3):
         bs.write_signed_int(7, 16)  # placeholder coords
     bs.write_int(0b1, 1)         # sentinel
@@ -439,12 +447,16 @@ def test_ordered_event_first_event_writes_explicit_seq():
 
 def test_static_brick_data_event_roundtrip():
     """StaticBrickDataEvent (classId 13) decode consumes the exact bit layout:
-    16*(4*readFloat(8)) + 16*(readInt(6)+readString) + readInt(10) N + N*readString.
+    64*(4*readFloat(8)) + 16*(readInt(6)+readString) + readInt(10) N + N*readString.
+
+    The palette is 64 rows (EXE loop @0x4a0910: edi 0x66b784..0x66bb84 step
+    0x10), not 16 -- the old 16-row value silently truncated every packet
+    carrying this event.
     """
     em = EventManager()
     bs = BitStream()
     bs.set_string_buffer(bytearray(256))
-    for _ in range(16):
+    for _ in range(64):
         for _ in range(4):
             bs.write_int(123, 8)
     for i in range(16):

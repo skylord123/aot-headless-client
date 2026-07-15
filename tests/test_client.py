@@ -4,6 +4,8 @@ clientCmd* dispatch into structured callbacks, and login crc encoding.
 
 import asyncio
 
+import pytest
+
 from aotbot.bitstream import BitStream
 from aotbot.client import AotClient, parse_chat_line
 from aotbot.config import Config
@@ -463,3 +465,146 @@ def test_sync_clock_status_survives_reset():
     _feed_command(client, "SyncClock", "999")
     client.reset()
     assert client.sync_clock_status()["uptime_seconds"] == 999.0
+
+
+# --------------------------------------------------------------------------- #
+# Fatal event-stream desync -> forced disconnect (the VPS zombie fix)
+# --------------------------------------------------------------------------- #
+
+
+def _desynced_body() -> BitStream:
+    """A server->client packet body whose event section hits an unknown event
+    classId (15) -- the exact signature of the live desync."""
+    bs = BitStream()
+    bs.write_int(0, 32)          # moveAck
+    for _ in range(4):
+        bs.write_flag(False)     # damage/control/camera/fov flags
+    bs.write_flag(True)          # unguaranteed event present
+    bs.write_int(15, 4)          # unknown event classId
+    return BitStream(bs.get_bytes())
+
+
+@pytest.mark.asyncio
+async def test_fatal_event_desync_forces_single_disconnect():
+    client = AotClient(_cfg())
+    calls = []
+
+    class FakeConn:
+        async def disconnect(self, reason="Done"):
+            calls.append(reason)
+
+    client.conn = FakeConn()
+    # Two desynced packets in a row: teardown starts once, no duplicate tasks.
+    client._read_body(_desynced_body())
+    client._read_body(_desynced_body())
+    assert client._desync_abort_started is True
+    await asyncio.sleep(0)  # let the spawned disconnect task run
+    assert calls == ["event stream desync"]
+
+
+@pytest.mark.asyncio
+async def test_ghost_desync_does_not_disconnect():
+    client = AotClient(_cfg(aot_track_objects=True))
+    client.phases.ghosting_active = True
+
+    class FakeConn:
+        async def disconnect(self, reason="Done"):
+            raise AssertionError("ghost-section loss must not drop the connection")
+
+    client.conn = FakeConn()
+    bs = BitStream()
+    bs.write_int(0, 32)          # moveAck
+    for _ in range(4):
+        bs.write_flag(False)
+    for _ in range(2):
+        bs.write_flag(False)     # empty event section (2 terminator flags)
+    bs.write_flag(True)          # ghost presence
+    bs.write_int(0, 4)           # idSize = 3
+    bs.write_flag(True)          # ghost present
+    bs.write_int(5, 3)           # ghost id
+    bs.write_flag(False)         # not a remove
+    bs.write_int(5, 6)           # unported object class
+    client._read_body(BitStream(bs.get_bytes()))
+    assert client._desync_abort_started is False
+    await asyncio.sleep(0)
+
+
+def test_reset_clears_desync_abort_guard():
+    client = AotClient(_cfg())
+    client._desync_abort_started = True
+    client.reset()
+    assert client._desync_abort_started is False
+
+
+# --------------------------------------------------------------------------- #
+# Deferred auto-login while our username is still in-world (ghost session)
+# --------------------------------------------------------------------------- #
+
+
+def _capture_sent(client):
+    sent = []
+    client.events.command_to_server = lambda verb, *a: sent.append((verb, a))
+    return sent
+
+
+def test_auto_login_deferred_while_username_online():
+    """A crashed previous session can still hold our character in-world; the
+    auto-login must wait instead of sending a doomed login."""
+    client = AotClient(_cfg())  # username "bot"
+    # Roster sync lists OUR username under another client id (the ghost session).
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "bot", "111", "",
+                  "\x04Port Town", "0", "0", "0")
+    sent = _capture_sent(client)
+    client._on_phase2_acked()
+    client._on_ingame()
+    assert [v for v, _ in sent if v == "login"] == []
+    assert client._login_deferred is True
+    # The ghost session finally drops -> login fires automatically.
+    _feed_command(client, "ServerMessage", "MsgClientDrop", "", "bot", "111")
+    assert [v for v, _ in sent if v == "login"] == ["login"]
+    assert client._login_deferred is False
+
+
+def test_auto_login_username_match_is_case_insensitive():
+    client = AotClient(_cfg())
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "BOT", "111", "",
+                  "\x04Shop", "0", "0", "0")
+    sent = _capture_sent(client)
+    client._on_phase2_acked()
+    assert [v for v, _ in sent if v == "login"] == []
+
+
+def test_auto_login_proceeds_when_username_free():
+    """Other players (and logged-out placeholders) never block the login."""
+    client = AotClient(_cfg())
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "SomeoneElse",
+                  "42", "", "\x04Port Town", "0", "0", "0")
+    _feed_command(client, "ServerMessage", "MsgClientJoin", "", "<Logged Out>",
+                  "43", "", "", "0", "0", "0")
+    sent = _capture_sent(client)
+    client._on_phase2_acked()
+    assert [v for v, _ in sent if v == "login"] == ["login"]
+
+
+def test_already_logged_in_warning_arms_deferred_retry():
+    """If we race the roster sync and the server rejects with 'already logged
+    in', the next roster drop retries the login automatically."""
+    client = AotClient(_cfg())
+    results = []
+    client.on_login_result = lambda ok, detail: results.append((ok, detail))
+    _feed_command(client, "WarningBox",
+                  "That character is already logged in!", "Okay")
+    assert client._login_deferred is True
+    assert results == [(False, "That character is already logged in!")]
+    sent = _capture_sent(client)
+    _feed_command(client, "ServerMessage", "MsgClientDrop", "", "bot", "111")
+    assert [v for v, _ in sent if v == "login"] == ["login"]
+
+
+def test_login_success_requests_whole_world_scope():
+    """On login the client sends dropCameraAtPlayer so the server ghosts every
+    object regardless of distance (cameraHack.cs parity)."""
+    client = AotClient(_cfg())
+    sent = _capture_sent(client)
+    _feed_command(client, "LoginSuccess")
+    assert ("dropCameraAtPlayer", ()) in sent

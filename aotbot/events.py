@@ -670,16 +670,27 @@ class EventManager:
         logger.debug("Sim2DAudioEvent: profile=%d", profile_id)
 
     def _read_sim3d_audio_event(self, bs: BitStream) -> None:
-        """Sim3DAudioEvent::unpack (AoT @ VA 0x45a6b0): readInt(10) datablock id
-        then a compressed Point3F position (readCompressedPoint).
+        """Sim3DAudioEvent::unpack (AoT @ VA 0x45a6b0), RE-DISASSEMBLED.
 
-        A positional sound cue (e.g. ambient mission audio sent on connect).
-        EXE-confirmed: ``readInt(0xa=10)`` profile id, then
-        ``readCompressedPoint`` (2-bit type + 3 coords). Decoded to stay aligned;
-        discarded.
+        The old transcription (profile id + compressed point) missed the whole
+        transform block, under-reading every 3D sound cue with an orientation
+        and silently truncating the rest of the packet's events. True layout:
+
+          * readInt(10)                     audio-profile datablock id (+3)
+          * flag (bit test @0x45a763):      transform present; if SET ->
+              - 3 x readFloat(8)            compressed quaternion x,y,z
+                (width from the global @0x63d56c == 8; reads @0x45a794/7a5/7b7)
+              - flag                        quat w sign (@0x45a817 -> fchs)
+          * readCompressedPoint             position (@0x45a73f, scale from the
+                                            global @0x63d568) -- ALWAYS read.
         """
         profile_id = bs.read_int(DATABLOCK_AUDIO_ID_BITS)
-        _read_compressed_point(bs)
+        if bs.read_flag():                 # transform present (0x45a763)
+            bs.read_float(8)               # quat x (0x45a794)
+            bs.read_float(8)               # quat y (0x45a7a5)
+            bs.read_float(8)               # quat z (0x45a7b7)
+            bs.read_flag()                 # quat w sign (0x45a817)
+        _read_compressed_point(bs)         # position (0x45a73f)
         logger.debug("Sim3DAudioEvent: profile=%d", profile_id)
 
     def _read_lightning_strike_event(self, bs: BitStream) -> None:
@@ -841,7 +852,12 @@ class EventManager:
     # palette, 16*(readInt(6)+readString) brick categories, readInt(10) N then
     # N*readString. readFloat(8) = readInt(8); readString uses the stringBuffer
     # dedup path.
-    STATIC_BRICK_PALETTE_ROWS = 16
+    # RE-DISASSEMBLED: the palette loop @0x4a0910 walks edi from 0x66b784 to
+    # 0x66bb84 in 0x10 steps = (0x66bb84-0x66b784)/0x10 = 64 rows, NOT 16.
+    # The old value under-read 48 rows x 32 bits = 1536 bits per event,
+    # silently truncating every packet carrying a StaticBrickDataEvent.
+    # (The category loop @0x4a0950 really is 16: ``cmp edi, 0x40`` step 4.)
+    STATIC_BRICK_PALETTE_ROWS = 64
     STATIC_BRICK_CATEGORY_ROWS = 16
 
     def _read_static_brick_data_event(self, bs: BitStream) -> None:

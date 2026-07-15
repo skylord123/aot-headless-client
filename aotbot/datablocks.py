@@ -482,9 +482,14 @@ def _unpack_shape_base_image_data(bs: BitStream) -> None:
     bs.read_string()                   # [+0xc6c]
     bs.read_bytes(4)                   # [+0xc70]
     if not bs.read_flag():             # box read when flag CLEAR [+0xc74]
+        # 0x421800 is 193 BITS (Box6F + trailing sign flag), not 24 bytes --
+        # see ghosts._read_box6f (WAVE-12). Reading 192 bits here left the
+        # cursor 1 bit short per box.
         bs.read_bytes(24)              # Box6F
+        bs.read_flag()                 # trailing sign flag (@0x4218ad)
     if not bs.read_flag():             # [+0xcb4]
         bs.read_bytes(24)
+        bs.read_flag()                 # trailing sign flag
     bs.read_flag()                     # bare [+0xc69]
     bs.read_flag()                     # bare [+0xc6a]
     bs.read_bytes(4)                   # [+0xcf8]
@@ -492,7 +497,16 @@ def _unpack_shape_base_image_data(bs: BitStream) -> None:
     bs.read_bytes(4)                   # [+0xd00]
     bs.read_flag()                     # bare [+0xd89]
     _read_db_ref(bs)                   # [+0xcf4]
-    if bs.read_flag():                 # [+0xd08]
+    # RE-DISASSEMBLED (0x485d47..0x485dfb): after the [+0xcf4] db-ref the exe
+    # reads a BARE flag -> [+0xd05] (inline bit test @0x485d47) and then an
+    # UNCONDITIONAL readInt(getBinLog2(getNextPow2(4))=2) -> [+0xd08]
+    # (@0x485d67..0x485d87). The d0c..d20 group is gated on the 2-bit INT
+    # being non-zero (``test eax,eax; je 0x485dfb`` @0x485d85), NOT on a flag.
+    # The prior transcription collapsed all this into one gate flag, leaving
+    # the cursor 2 bits short on EVERY ShapeBaseImageData -- the head-of-stream
+    # desync that shredded the datablock load phase.
+    bs.read_flag()                     # bare [+0xd05]
+    if bs.read_int(2):                 # [+0xd08] (2-bit int, also the gate)
         bs.read_bytes(4)               # [+0xd20]
         bs.read_bytes(4)               # [+0xd1c]
         bs.read_float(7)               # [+0xd0c]
@@ -526,21 +540,30 @@ def _unpack_shape_base_image_data(bs: BitStream) -> None:
                 bs.read_signed_int(16)
             bs.read_flag()             # bare [edi+0x44]
             bs.read_flag()             # bare [edi+0x28]
-            # WAVE-18 RUNTIME FIX (winedbg-triggered; CFG re-walked at
-            # 0x48625e..0x486288): the per-state-block tail is DONE after the two
-            # bare flags above. The +0x54 and +0x58 fields are set to CONSTANT 0
-            # (``mov [edi+0x54],0`` @0x486264; ``mov [edi+0x58],eax`` eax=0
-            # @0x48627d) -- NO flag read, NO field read -- then ``add edi,0x6c``
-            # advances to the next state. The prior transcription read TWO spurious
-            # flag-gated blocks here (a flag+readInt(10)+2xread(4), and a
-            # flag+readInt(10)). On worlds whose images populate these state blocks
-            # (e.g. the Ball-spell / equipped-image set) those extra reads slipped
-            # the cursor a few bits before the NEXT state's readString, which then
-            # Huffman-self-terminated at a garbage offset -- the runaway ~2500-bit
-            # ShapeBaseImageData over-read that desynced the post-login datablock
-            # burst (event classId 15) and stopped the bot before it ever scoped
-            # the Player ghosts. (Older capture worlds left every image state-block
-            # mask clear, so the spurious reads were never exercised there.)
+            # Per-state tail, RE-DISASSEMBLED (this reverts the WAVE-18 removal,
+            # which was itself the regression). At 0x486258 the inline-readFlag
+            # bounds check ``jle 0x4862df`` jumps to the OUT-OF-LINE bit test;
+            # its flag-SET path (0x486307) reads readInt(getBinLog2(
+            # getNextPow2(0x400))=10)+3 -> [edi+0x54] followed by TWO raw
+            # read(4) -> [edi+0x5c]/[edi+0x60], then rejoins at 0x48626b. The
+            # ``mov [edi+0x54],0`` @0x486264 that WAVE-18 read as "constant
+            # store, no bits" is only the flag-CLEAR / past-end DEFAULT path.
+            # Same shape for [edi+0x58] (bit test @0x486357, flag-SET path
+            # @0x48637f reads readInt(10)+3). Dropping these two flag reads
+            # under-consumed >=2 bits for every PRESENT state block, which
+            # desynced the next state's readString and shredded the whole
+            # datablock load stream on worlds with populated image states --
+            # the silent per-packet tail losses that eventually ate
+            # GhostAlwaysObjectEvents/NetStringEvents and zombied the session.
+            # (Capture-validated: tools/captures/live_session_dbg.jsonl replays
+            # clean with these reads restored; it over-read 61 bits at
+            # datablock index 72 without them.)
+            if bs.read_flag():         # [edi+0x54] present (bit test @0x4862df)
+                bs.read_int(10)        # +3 (datablock-id ref @0x48631d)
+                bs.read_bytes(4)       # [edi+0x5c] (@0x486333)
+                bs.read_bytes(4)       # [edi+0x60] (@0x486348)
+            if bs.read_flag():         # [edi+0x58] present (bit test @0x486357)
+                bs.read_int(10)        # +3 (@0x486395)
     bs.read_string()                   # [+0x1ac4]
     bs.read_string()                   # [+0x1ac8]
     bs.read_string()                   # [+0x1acc]
@@ -762,7 +785,17 @@ def _unpack_projectile_data(bs: BitStream) -> None:
       * flag; if set 3 x read(4)                [+0x88 -> +0x94,+0x8c,+0x90]
     """
     bs.read_string()                   # projectileShapeName [+0x40]
-    if bs.read_flag():                 # scale present [+0x70]
+    # RE-DISASSEMBLED: [+0x70] is a BARE bool flag (``mov [edi+0x70], al``
+    # @0x475ae6, faceViewer-style), and the scale group is gated by a SECOND,
+    # separate flag (inline bit test @0x475b14; clear -> defaults 1,1,1
+    # @0x475af5). The old transcription fused them into one flag, leaving the
+    # cursor 1 bit short on EVERY ProjectileData -- which silently shredded the
+    # rest of each load-phase packet carrying one (capture-validated: the solo
+    # ProjectileData packet in real_login.jsonl hand-walks to the exact next
+    # event boundary with this flag restored, values 0.1/1.0/0.2 decoding
+    # bit-clean).
+    bs.read_flag()                     # bare bool [+0x70]
+    if bs.read_flag():                 # scale present (defaults 1,1,1)
         bs.read_bytes(4)               # [+0x74]
         bs.read_bytes(4)               # [+0x78]
         bs.read_bytes(4)               # [+0x7c]

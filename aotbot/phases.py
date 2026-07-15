@@ -106,7 +106,25 @@ def _read_compressed_point(bs: BitStream) -> None:
 class AlignmentError(Exception):
     """Raised when a packet body contains content we can't decode (control
     object / ghost / unknown event) -- continuing would desync the bitstream.
+
+    ``fatal`` is True when alignment was lost in the CONTROL HEADER or the
+    EVENT SECTION -- i.e. before the guaranteed-ordered event stream for this
+    packet was fully consumed. The connection layer still ACKs the packet, so
+    the server drops the undelivered events and never resends them: any
+    NetStringEvent (string-table teach), GhostAlwaysObjectEvent, or
+    RemoteCommandEvent riding the lost tail is gone for good, and the session's
+    shared state (string table, ghost-class table, mission phase) silently
+    diverges from the server's. The stream never recovers -- the only remedy is
+    to drop the connection and let auto-reconnect build a fresh session.
+
+    ``fatal`` is False for GHOST-SECTION losses: those happen after the event
+    section was consumed, so only the remainder of that one packet's
+    (unguaranteed) ghost updates is dropped and the session stays usable.
     """
+
+    def __init__(self, message: str, fatal: bool = False) -> None:
+        super().__init__(message)
+        self.fatal = fatal
 
 
 class MissionState(enum.Enum):
@@ -470,7 +488,10 @@ class GameConnectionPhases:
             try:
                 self.events.read_events(bs)
             except EventDecodeError as exc:
-                raise AlignmentError(str(exc)) from exc
+                # Event-section loss is FATAL: the packet is still ACKed, so
+                # every guaranteed-ordered event in the dropped tail is lost
+                # forever and the session state diverges (see AlignmentError).
+                raise AlignmentError(str(exc), fatal=True) from exc
             # Install the point-compression REFERENCE for this packet's ghost
             # section: BitStream::readCompressedPoint (0x421a70) dequantises
             # types 0/1/2 as ``raw * 0.01 + reference``, where the engine's
@@ -543,8 +564,11 @@ class GameConnectionPhases:
                 try:
                     _gh.read_packet_data(bs, class_id)
                 except _gh.GhostDecodeError as exc:
+                    # Fatal: the control header precedes the event section, so
+                    # this packet's guaranteed events are lost-but-ACKed too.
                     raise AlignmentError(
-                        f"control-object readPacketData not ported: {exc}"
+                        f"control-object readPacketData not ported: {exc}",
+                        fatal=True,
                     ) from exc
                 finally:
                     if sink is not None:

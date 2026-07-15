@@ -246,6 +246,56 @@ def test_read_ghost_section_ported_class_decodes():
     assert not rs.error
 
 
+def test_read_packet_body_event_desync_is_fatal():
+    """An undecodable event classId in the EVENT section raises AlignmentError
+    with fatal=True: the packet is ACKed regardless, so the guaranteed-ordered
+    events in the dropped tail are lost forever and the session cannot recover
+    (the VPS zombie: connected + logged in, but no chat/roster events ever
+    decode again)."""
+    p = _make()
+    bs = BitStream()
+    # server->client control header: moveAck + 4 zero flags.
+    bs.write_int(7, 32)
+    for _ in range(4):
+        bs.write_flag(False)
+    # Event section: one unguaranteed event with an unknown classId (15 -- the
+    # 4-bit id space only defines 0..13, exactly what the live desync logged).
+    bs.write_flag(True)
+    bs.write_int(15, 4)
+    rs = BitStream(bs.get_bytes())
+    with pytest.raises(AlignmentError) as ei:
+        p.read_packet_body(rs)
+    assert ei.value.fatal is True
+
+
+def test_read_packet_body_ghost_desync_is_not_fatal():
+    """An unported ghost class in the GHOST section raises AlignmentError with
+    fatal=False: the event section was already consumed, so only that packet's
+    ghost updates are lost and the session stays usable."""
+    p = _make(track_objects=True)
+    p.ghosting_active = True
+    bs = BitStream()
+    # control header: moveAck + 4 zero flags.
+    bs.write_int(7, 32)
+    for _ in range(4):
+        bs.write_flag(False)
+    # empty event section (read side consumes exactly two terminator flags:
+    # end-of-unguaranteed + end-of-guaranteed).
+    for _ in range(2):
+        bs.write_flag(False)
+    # ghost section: one NEW ghost of an unported class (5 == FlyingVehicle).
+    bs.write_flag(True)        # presence
+    bs.write_int(0, 4)         # idSize = 3
+    bs.write_flag(True)        # ghost present
+    bs.write_int(5, 3)         # ghost id
+    bs.write_flag(False)       # not a remove
+    bs.write_int(5, 6)         # classId 5 (no unpackUpdate ported)
+    rs = BitStream(bs.get_bytes())
+    with pytest.raises(AlignmentError) as ei:
+        p.read_packet_body(rs)
+    assert ei.value.fatal is False
+
+
 def test_read_body_server_to_client_empty():
     """A minimal server->client body (control header all-zero flags + empty
     event section + empty ghost flag) parses cleanly and consumes every bit.
