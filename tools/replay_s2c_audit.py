@@ -14,6 +14,13 @@ Mirrors client._read_body ordering, including the dnet header + rate block, and
 keeps cross-packet state (phases/_ghost_classes/string table) exactly like the
 live client so state-poisoning cascades reproduce.
 
+The ghost table is kept ACK-FAITHFUL (tools/ack_replay.py): each s2c packet's
+ghost creates/removes are staged and rolled back if the REAL client's c2s ack
+mask NACKed that packet -- because the server then re-sends the creates, and
+replaying them against a table the real client never committed misparses the
+re-sent create as an update (combat_session.jsonl line 4119+). Captures without
+c2s lines behave exactly as before (every staged diff stays applied).
+
 Run: .venv/bin/python tools/replay_s2c_audit.py CAPTURE.jsonl [--verbose]
 """
 import json
@@ -26,6 +33,7 @@ from aotbot.bitstream import BitStream
 from aotbot import protocol_constants as pc
 from aotbot.events import EventManager
 from aotbot.phases import GameConnectionPhases, AlignmentError
+from tools.ack_replay import GhostAckTracker
 
 logging.disable(logging.CRITICAL)
 
@@ -65,8 +73,15 @@ def main() -> int:
     n_data = 0
     prev_seq = None
 
+    tracker = GhostAckTracker(ph._ghost_classes)
+
     for i, line in enumerate(open(path)):
         rec = json.loads(line)
+        if rec.get("dir") == "c2s":
+            data = bytes.fromhex(rec["hex"])
+            if data and (data[0] & 0x01):
+                tracker.on_c2s(data)  # real client's ack verdicts
+            continue
         if rec.get("dir") != "s2c":
             continue
         data = bytes.fromhex(rec["hex"])
@@ -90,10 +105,12 @@ def main() -> int:
 
         n_bad_before = len(bad_class_hits)
         exc_txt = None
+        before = tracker.snapshot()
         try:
             ph.read_packet_body(bs)
         except (AlignmentError, Exception) as exc:  # noqa: BLE001
             exc_txt = f"{type(exc).__name__}: {exc}"
+        tracker.stage(seq, before)
 
         residual = len(data) * 8 - bs.get_bit_position()
         events = []

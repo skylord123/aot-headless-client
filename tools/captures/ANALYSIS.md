@@ -120,3 +120,28 @@ Run the bot live (LIVE server — clean connects only, one session at a time):
     .venv/bin/python -m aotbot.main            # uses .env (creds, host/port)
     # or against the relay for capture:
     .venv/bin/python -m aotbot.main --host 127.0.0.1 --port 28000
+
+## Wave-23 — combat_session.jsonl (live combat NACK-storm capture)
+
+`combat_session.jsonl` (4367 lines, 2173 s2c DATA packets): a live session with
+active melee combat near the bot — the capture that reproduced the "173 NACKed
+packets in 150s" bitstream-overrun storm. Two independent findings, both fixed:
+
+1. **ShapeBase sound-thread polarity bug (ghosts.py)**: the 4-slot loop @
+   0x4840f0..0x4841aa (previously mislabeled "image-skin") is TGE's SoundMaskN.
+   The 10-bit sound datablock id @0x484170 is read when the per-slot *play*
+   flag (setne @0x484147) is **SET** (`cmp al,1; jne 0x48417f` @0x484150
+   skips the read when clear) — the transcription had it inverted, silently
+   under-reading 10 bits per playing sound. Harmless pre-combat (no sounds),
+   fatal the moment weapon sounds fire on any ShapeBase-derived ghost.
+2. **Ack-faithful replay (tools/ack_replay.py)**: from line 4119 the capture is
+   only decodable when the replay honors the REAL client's c2s ack verdicts —
+   the then-buggy live client NACKed whole windows (ackMask=0), so the server
+   re-sent ghost CREATES; a replay that commits every cleanly decoded packet
+   parses the re-sent create as an update. replay_s2c_audit / trace_capture_pkt
+   now stage each packet's ghost-table diff and roll it back on a NACK verdict
+   (server handleNotify -> packetDropped mirror). Captures without c2s lines
+   are unaffected.
+
+Audit after both fixes: 0 exceptions, 0 bs.error, 11 benign 8-bit pad
+residuals (was 151 exceptions / 21 bs.error / 91 residuals up to 3197 bits).

@@ -2,7 +2,10 @@
 """Replay a capture up to a target line, then bit-trace that packet's body:
 control header fields, every event (classid + cursor), every ghost record
 (id / new / class / bits consumed). State (ghost table, string table, phases)
-is built by replaying every prior packet exactly like the live client.
+is built by replaying every prior packet exactly like the live client, with
+the ghost table kept ack-faithful to the REAL client's c2s ack verdicts
+(tools/ack_replay.py -- NACKed packets' ghost creates/removes are rolled back,
+because the server re-sends them).
 
 Run: .venv/bin/python tools/trace_capture_pkt.py CAPTURE.jsonl TARGET_LINE
 """
@@ -17,6 +20,7 @@ from aotbot import protocol_constants as pc
 from aotbot import ghosts as gh
 from aotbot.events import EventManager, EventDecodeError
 from aotbot.phases import GameConnectionPhases, AlignmentError
+from tools.ack_replay import GhostAckTracker
 
 logging.disable(logging.CRITICAL)
 
@@ -179,9 +183,15 @@ def main():
     ph = GameConnectionPhases(em, skip_lighting=True, track_objects=False)
     em.request_send = lambda: None
 
+    tracker = GhostAckTracker(ph._ghost_classes)
     prev_seq = None
     for i, line in enumerate(open(path)):
         rec = json.loads(line)
+        if rec.get("dir") == "c2s":
+            data = bytes.fromhex(rec["hex"])
+            if data and (data[0] & 0x01):
+                tracker.on_c2s(data)  # real client's ack verdicts
+            continue
         if rec.get("dir") != "s2c":
             continue
         data = bytes.fromhex(rec["hex"])
@@ -196,10 +206,12 @@ def main():
             trace(ph, em, data, seq)
             return
         rate_block(bs)
+        before = tracker.snapshot()
         try:
             ph.read_packet_body(bs)
         except (AlignmentError, Exception):  # noqa: BLE001
             pass
+        tracker.stage(seq, before)
 
 
 if __name__ == "__main__":

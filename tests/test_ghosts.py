@@ -83,6 +83,37 @@ def test_shape_base_all_clear():
     assert _decode("ShapeBase", w) == 3
 
 
+def test_shape_base_sound_thread_play_polarity():
+    # WAVE-23: the 4-slot SOUND-thread loop (0x4840f0..0x4841aa). The 10-bit
+    # sound datablock id (0x484170) is read when the per-slot "play" flag
+    # (setne @0x484147) is SET -- `cmp al,1; jne 0x48417f` @0x484150/0x484158
+    # SKIPS the read when it is clear (TGE shapeBase.cc: `st.play = readFlag();
+    # if (st.play) profile = readRangedU32(...)`). The prior transcription had
+    # the polarity inverted, under-reading 10 bits per playing sound.
+    #
+    # Layout: GameBase pos(0)+datablock(0) + master(1) + damage(0) + thread(0)
+    # + sound(1) + slot0[present(1) play(1) id(10)] + slot1[present(1) play(0)]
+    # + slot2(0) + slot3(0) + image(0) + core(0) + mount(0) = 25 bits.
+    def w(bs):
+        bs.write_flag(False)          # GameBase pos mask
+        bs.write_flag(False)          # GameBase datablock mask
+        bs.write_flag(True)           # ShapeBase master mask (0x483e06)
+        bs.write_flag(False)          # damage block (0x483e36)
+        bs.write_flag(False)          # thread loop (0x483f13)
+        bs.write_flag(True)           # sound loop (0x4840ce)
+        bs.write_flag(True)           # slot 0 present (0x48411d)
+        bs.write_flag(True)           # slot 0 play SET (0x484147)
+        bs.write_int(0x2A7, 10)       # slot 0 sound datablock id (0x484170)
+        bs.write_flag(True)           # slot 1 present
+        bs.write_flag(False)          # slot 1 play CLEAR -> NO id read
+        bs.write_flag(False)          # slot 2 absent
+        bs.write_flag(False)          # slot 3 absent
+        bs.write_flag(False)          # mounted-image loop (0x4841ea)
+        bs.write_flag(False)          # core-state block (0x484572)
+        bs.write_flag(False)          # mount block (0x484aa4)
+    assert _decode("ShapeBase", w) == 25
+
+
 def test_static_shape_all_clear():
     # ShapeBase (3 clear flags) + box/point flag(0) + static bool(0) = 5 bits.
     def w(bs):

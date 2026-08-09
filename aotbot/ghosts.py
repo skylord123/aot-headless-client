@@ -394,14 +394,22 @@ def _unpack_shape_base(bs: BitStream, is_new: bool) -> None:
                 bs.read_flag()      # (0x483fad)
                 bs.read_flag()      # (0x483fdf)
 
-    # 0x4840ce: 4-slot image-skin loop (0x4840f0..0x4841aa).
+    # 0x4840ce: 4-slot SOUND-thread loop (0x4840f0..0x4841aa; TGE shapeBase.cc
+    # SoundMaskN -- was mislabeled "image-skin").
     if bs.read_flag():
         for _ in range(4):
             if bs.read_flag():      # per-slot present (0x48411d)
-                # 0x484147: if this flag is CLEAR, read a 10-bit datablock id
-                # (readRangedU32(0,1023) = getBinLog2(getNextPow2(1024)) = 10).
-                if not bs.read_flag():
-                    bs.read_int(10)  # (0x484170)
+                # 0x484147 setne cl = st.play; 0x484150 `cmp al,1` /
+                # 0x484158 `jne 0x48417f` SKIPS the read when the flag is
+                # CLEAR -- i.e. the 10-bit datablock id (readRangedU32:
+                # getBinLog2(getNextPow2(0x400))=10 @0x48415a-0x48416a, +3
+                # DataBlockObjectIdFirst @0x484179) is read when play is SET
+                # (matches TGE `st.play = readFlag(); if (st.play) profile =
+                # readRangedU32(...)`). WAVE-23 FIX: prior transcription had
+                # the polarity inverted, under-reading 10 bits per playing
+                # sound -- silent pre-combat, fatal once weapon sounds fire.
+                if bs.read_flag():   # play (0x484147)
+                    bs.read_int(10)  # sound datablock id (0x484170)
 
     # 0x4841ea: 8-slot mounted-image loop (0x484207..0x48452e).
     if bs.read_flag():
