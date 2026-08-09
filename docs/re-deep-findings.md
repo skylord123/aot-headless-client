@@ -320,7 +320,7 @@ flag** (@ 0x548d35 — `push 7; readInt` directly). Stock TGE had a shortcut bit
 |---|---|---|---|
 | ConnectionMessageEvent | 0 | 0x5464a0 | U32 seq, readInt(3) msg, readInt(15) ghostCount |
 | FileChunkEvent | 1 | 0x5481b0 | readRangedU32(0,63) len + len raw bytes |
-| FileDownloadRequestEvent | 2 | (stock) | readRangedU32(0,31) + that many readString |
+| FileDownloadRequestEvent | 2 | unpack @ 0x5480a0 (EXE-confirmed) | readRangedU32(0,31) + that many readString |
 | LightningStrikeEvent | 4 | 0x4b35f0 | **empty** (bare ret — no wire payload) |
 | NetStringEvent | 5 | 0x5442e0 | readInt(5) slot + readString |
 | PathManagerEvent | 6 | 0x54d2c0 | U32 modPath, flag clearPaths, U32 totalTime, U32 numPoints, then per-point data |

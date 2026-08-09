@@ -270,3 +270,87 @@ def test_process_raw_packet_acks_and_advances():
         await server.stop()
 
     asyncio.run(go())
+
+
+def _server_data_packet(conn, send_seq: int) -> bytes:
+    """A minimal server->client DataPacket (header + zero rate block, empty
+    body) with the given server send seq."""
+    pkt = BitStream()
+    pkt.write_flag(True)
+    pkt.write_int(conn.connect_sequence & 1, 1)
+    pkt.write_int(send_seq, 9)
+    pkt.write_int(0, 9)   # server's last recvd of us
+    pkt.write_int(pc.PACKET_TYPE_DATA, 2)
+    pkt.write_int(0, 3)   # ackByteCount 0
+    pkt.write_flag(False)  # rate block
+    pkt.write_flag(False)
+    return pkt.get_bytes()
+
+
+def test_undecodable_body_clears_ack_bit():
+    """A body hook returning False makes the connection NACK the packet: the
+    receive window advances but the ack-mask bit for that seq stays 0, so the
+    server's notify sees it as dropped and re-sends its reliable content."""
+    async def go():
+        server = MockServer()
+        await server.start()
+        t = UdpTransport()
+        await t.open(local_addr=("127.0.0.1", 0))
+        conn = NetConnection(t, server.addr)
+        ok = await conn.connect(timeout=5.0)
+        assert ok
+
+        verdicts = [False, True]  # first body undecodable, second fine
+        conn.read_packet_body = lambda bs: verdicts.pop(0)
+
+        server.transport.sendto(_server_data_packet(conn, 1), t.local_addr())
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if conn.last_seq_recvd == 1:
+                break
+        assert conn.last_seq_recvd == 1     # window advanced regardless
+        assert (conn.ack_mask & 1) == 0     # ...but the packet is NACKed
+
+        server.transport.sendto(_server_data_packet(conn, 2), t.local_addr())
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if conn.last_seq_recvd == 2:
+                break
+        assert conn.last_seq_recvd == 2
+        assert (conn.ack_mask & 1) == 1     # decodable packet ACKed
+        assert (conn.ack_mask & 2) == 0     # seq 1's hole is preserved
+
+        await conn.disconnect("done")
+        t.close()
+        await server.stop()
+
+    asyncio.run(go())
+
+
+def test_body_hook_exception_counts_as_nack():
+    async def go():
+        server = MockServer()
+        await server.start()
+        t = UdpTransport()
+        await t.open(local_addr=("127.0.0.1", 0))
+        conn = NetConnection(t, server.addr)
+        ok = await conn.connect(timeout=5.0)
+        assert ok
+
+        def boom(bs):
+            raise RuntimeError("decoder exploded")
+        conn.read_packet_body = boom
+
+        server.transport.sendto(_server_data_packet(conn, 1), t.local_addr())
+        for _ in range(50):
+            await asyncio.sleep(0.02)
+            if conn.last_seq_recvd == 1:
+                break
+        assert conn.last_seq_recvd == 1
+        assert (conn.ack_mask & 1) == 0
+
+        await conn.disconnect("done")
+        t.close()
+        await server.stop()
+
+    asyncio.run(go())

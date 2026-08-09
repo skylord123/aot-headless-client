@@ -13,10 +13,12 @@ datablocks). The NetObject (game) class list, sorted by ASCII name, gives the
 
 NOTE: the object ``unpackUpdate`` methods are substantially larger than the
 datablock ``unpackData`` (they pack a transform + a sequence of update masks,
-each gating its own field block) and must be RE'd per class. None are ported
-yet, so any ghost class raises :class:`GhostDecodeError` carrying the class name
--- the caller (phases) turns that into an AlignmentError that logs exactly which
-object class blocks, which is the precise next RE target.
+each gating its own field block) and were RE'd per class. ALL 50 object classes
+now have a decoder in :data:`DECODERS`. :class:`GhostDecodeError` (carrying the
+class name) remains the containment path for the residual data-dependent gaps
+(WheeledVehicle's .dts-derived wheel count -- see
+:data:`WHEELED_VEHICLE_WHEEL_COUNT`) and count-overflow sanity guards -- the
+caller (phases) turns it into an AlignmentError that logs exactly what blocked.
 """
 
 from __future__ import annotations
@@ -344,7 +346,8 @@ def _unpack_shape_base(bs: BitStream, is_new: bool) -> None:
       flag (@0x483f13): if set -> 4 x [ flag; if set: readInt(6),readInt(2),flag,flag ];
       flag (@0x4840ce): if set -> 4 x [ flag; if set: flag; if NOT that flag: readInt(10) ];
       flag (@0x4841ea): if set -> 8 x [ flag; if set:
-            flag(if set:readInt(10)); flag x5; readInt(3); flag; readInt(6) x4 ];
+            flag(if set:readInt(10)); flag x5; readInt(3);
+            flag ONLY on the initial update; readInt(6) x4 ];
       flag (@0x484572): if set ->
           flag (@0x4845a2): if set -> flag; flag;
               flag(@0x484646): if set: flag(@0x484680); read(4)[4 bytes];
@@ -396,8 +399,21 @@ def _unpack_shape_base(bs: BitStream, is_new: bool) -> None:
                 # 5 inline flags (0x4842ed,0x484320,0x484353,0x484386,0x4843b9):
                 for _ in range(5):
                     bs.read_flag()
-                bs.read_int(3)       # (0x4843c9)
-                bs.read_flag()       # (0x484489)
+                bs.read_int(3)       # fireCount (0x4843c9)
+                # WAVE-20 FIX: the "isImageFiring" flag (inline read @0x484485/
+                # 0x484489) is only on the wire for the INITIAL update. Pack side
+                # (0x480a26): `test byte [esp+0x30], 2; je 0x480a3d` -- the
+                # writeFlag @0x480a38 only runs when the update mask has the
+                # InitialUpdateMask bit. Unpack side (0x484408): `mov edx,
+                # [ebx+0x18]; shr edx,3; test dl,1; je 0x48445e` -- the flag is
+                # only READ when the object is NOT yet properly added (i.e. this
+                # is the ghost-creation unpack). Matches TGE shapeBase.cc
+                # (`if (mask & InitialUpdateMask) stream->writeFlag(
+                # isImageFiring(i))` / `if (!isProperlyAdded()) bool firing =
+                # stream->readFlag()`). Reading it unconditionally over-read
+                # non-initial image updates by 1 bit.
+                if is_new:
+                    bs.read_flag()   # isImageFiring (0x484489, initial only)
                 for _ in range(4):
                     bs.read_int(6)   # (0x4844ba..0x4844db)
 
@@ -1147,6 +1163,224 @@ def _unpack_hover_vehicle(bs: BitStream, is_new: bool) -> None:
     bs.read_int(3)                    # +0x23a4 (0x4c9ab7)
 
 
+def _unpack_flying_vehicle(bs: BitStream, is_new: bool) -> None:
+    """FlyingVehicle::unpackUpdate (AoT @ VA 0x4c7c10; vtable 0x6039a4 slot 0x4c).
+
+    Vehicle::unpackUpdate (0x4cf130) parent, then a CONTROL-OBJECT gate:
+    ``cmp [this+0x274], con; je end`` (@0x4c7c24 -- ebx holds the NetConnection
+    arg, NOT a constant 0 as an earlier survey guessed). This is TGE
+    flyingVehicle.cc ``if (getControllingClient() == con) return;``: the tail is
+    skipped only when this ghost's mControllingClient IS the receiving
+    connection, i.e. when the FlyingVehicle is the client's OWN control object.
+    Matches the pack side: the server suppresses the tail only for the
+    controlling client's non-initial updates.
+
+    Gate-passed tail (both reads unconditional):
+      flag        createHeightOn  (inline readFlag @0x4c7c2c.. -> byte +0x2384);
+      readInt(3)  mThrustDirection (0x4c7c6e -> +0x2394, NumThrustBits=3).
+
+    CAVEAT (marked; not statically pinnable from the stream alone): we read the
+    tail UNCONDITIONALLY. mControllingClient is non-null client-side only after
+    the client processes setControlObject for this ghost -- never for a headless
+    bot that does not drive a vehicle, and null on the initial (creation) unpack
+    even when it will become the control object. AoT ships NO FlyingVehicleData
+    datablock in any game script/capture, so the class cannot be instantiated by
+    the live server at all; if a future world ever makes the bot DRIVE a
+    FlyingVehicle, its non-initial control updates would need the skip branch
+    (the control ghost id is tracked in phases._control_ghost_id)."""
+    _unpack_vehicle(bs, is_new)       # parent (0x4cf130)
+    # getControllingClient() == con gate (0x4c7c24): assumed NOT our control
+    # object (see docstring caveat); read the tail.
+    bs.read_flag()                    # createHeightOn +0x2384 (0x4c7c2c..0x4c7c62)
+    bs.read_int(3)                    # mThrustDirection +0x2394 (0x4c7c6e)
+
+
+# WheeledVehicle wheel count. ``mDataBlock->wheelCount`` ([db+0x500], read by
+# BOTH wheel loops in WheeledVehicle::unpackUpdate @ 0x4d2491/0x4d26cf) is
+# computed client-side in WheeledVehicleData::preload from the vehicle's .dts
+# shape ("hub%d" nodes) -- it is NOT on the wire and NOT in the
+# WheeledVehicleData::unpackData payload (0x4d1450), so it cannot be recovered
+# from the stream. AoT ships no WheeledVehicleData (no vehicle exists in any
+# game script or capture), so the loops can never legitimately run today; if a
+# modded world ever scopes one, set this to the vehicle shape's hub count.
+WHEELED_VEHICLE_WHEEL_COUNT: int | None = None
+
+
+def _unpack_wheeled_vehicle(bs: BitStream, is_new: bool) -> None:
+    """WheeledVehicle::unpackUpdate (AoT @ VA 0x4d2430; vtable 0x604bc4 slot
+    0x4c). CFG-followed 0x4d2445..0x4d273b; matches TGE wheeledVehicle.cc
+    bit-for-bit in structure (AoT widened the second wheel loop's fields to raw
+    F32 read(4), which stock TGE also uses -- no divergence found):
+
+      Vehicle::unpackUpdate (0x4cf130) parent;
+      flag W1 (@0x4d244a, wheel-datablock block): if set ->
+          wheelCount x [ flag (@0x4d24b8); if set:
+              readInt(10)  tire   db id (+3, Sim::findObject @0x4d253d/0x4d2546);
+              readInt(10)  spring db id (+3, @0x4d256a/0x4d2573);
+              rflag        wheel->powered (fn readFlag 0x421200 @0x4d2588 -> +0x50);
+              read(4)      wheel->steering F32 (@0x4d259b -> +0x4c) ];
+      flag W2 (@0x4d262c, ``jne 0x4d2736``): if SET -> return
+          (the controlling-client suppression bit -- ON the wire, unlike
+          FlyingVehicle's member-field gate);
+      flag         mBraking (inline @0x4d265e -> byte +0x237c);
+      flag W4 (@0x4d2693): if set ->
+          wheelCount x [ read(4) avel (+0x10); read(4) Dy (+0x18);
+                         read(4) Dx (+0x1c) ]   (loop @0x4d26f0..0x4d2734).
+
+    Both loops iterate ``mDataBlock->wheelCount`` ([db+0x500] @0x4d2491 /
+    0x4d26cf; wheel stride 0x60) -- a .dts-derived, NON-wire count; see
+    :data:`WHEELED_VEHICLE_WHEEL_COUNT`. When a loop is entered and the count is
+    unknown we raise GhostDecodeError with the precise reason (the stream cannot
+    be decoded further bit-exactly), which the caller logs and contains."""
+    _unpack_vehicle(bs, is_new)       # parent (0x4cf130)
+    if bs.read_flag():                # flag W1 wheel datablocks (0x4d244a)
+        if WHEELED_VEHICLE_WHEEL_COUNT is None:
+            raise GhostDecodeError(
+                39,
+                "WheeledVehicle wheel block present but wheelCount unknown "
+                "(mDataBlock->wheelCount is .dts-derived, not on the wire; "
+                "set ghosts.WHEELED_VEHICLE_WHEEL_COUNT)",
+            )
+        for _ in range(WHEELED_VEHICLE_WHEEL_COUNT):
+            if bs.read_flag():        # per-wheel present (0x4d24b8)
+                bs.read_int(10)       # tire db id (0x4d2507, +3 @0x4d2537)
+                bs.read_int(10)       # spring db id (0x4d2524, +3 @0x4d2566)
+                bs.read_flag()        # wheel->powered (0x4d2588, fn 0x421200)
+                bs.read_bytes(4)      # wheel->steering F32 (0x4d259b)
+    if bs.read_flag():                # flag W2 (0x4d262c): set -> return
+        return
+    bs.read_flag()                    # mBraking +0x237c (0x4d265e)
+    if bs.read_flag():                # flag W4 wheel motion (0x4d2693)
+        if WHEELED_VEHICLE_WHEEL_COUNT is None:
+            raise GhostDecodeError(
+                39,
+                "WheeledVehicle wheel-motion block present but wheelCount "
+                "unknown (see ghosts.WHEELED_VEHICLE_WHEEL_COUNT)",
+            )
+        for _ in range(WHEELED_VEHICLE_WHEEL_COUNT):
+            bs.read_bytes(4)          # wheel->avel (0x4d26fb -> +0x10)
+            bs.read_bytes(4)          # wheel->Dy   (0x4d2710 -> +0x18)
+            bs.read_bytes(4)          # wheel->Dx   (0x4d2725 -> +0x1c)
+
+
+def _unpack_path_camera(bs: BitStream, is_new: bool) -> None:
+    """PathCamera::unpackUpdate (AoT @ VA 0x4649c0; vtable 0x5f987c slot 0x4c).
+
+    ShapeBase parent, then FOUR flag-gated blocks + one unconditional trailing
+    flag (CFG-followed 0x4649d0..0x464c06; mirrors TGE pathCamera.cc exactly):
+
+      flag (@0x4649d5): if set -> readInt(3)   mState (StateBits, 0x464a11 -> +0xaa4);
+      flag (@0x464a1c): if set -> read(4)      mPosition F32 (0x464a5f -> +0xaa0);
+      flag (@0x464a7e): if set -> flag mTargetSet (@0x464ab2 -> +0xaac);
+                                  if THAT set -> read(4) mTarget (0x464af0 -> +0xaa8);
+      flag (@0x464afd): if set ->              (spline WindowMask)
+          (0x44fa20 spline clear -- no reads)
+          read(4)  mNodeBase  (0x464b52 -> +0xa98);
+          read(4)  mNodeCount (0x464b6a -> +0xa9c, SIGNED: loop only if > 0);
+          mNodeCount x [ Point3F(12B) knot pos (0x464b95);
+                         4 x read(4) knot rot QuatF (16B via 0x4656d0 @0x464b9f);
+                         read(4)     knot speed (0x464bb2);
+                         readInt(2)  knot type (0x464bc0);
+                         readInt(1)  knot path (0x464bcc) ];
+      flag (@0x464beb): unconditional trailing 1-bit (TGE's "controlled by the
+          client?" flag; no payload either way)."""
+    _unpack_shape_base(bs, is_new)    # parent (0x483d90)
+    if bs.read_flag():                # StateMask (0x4649d5)
+        bs.read_int(3)                # mState (0x464a11)
+    if bs.read_flag():                # PositionMask (0x464a1c)
+        bs.read_bytes(4)              # mPosition F32 (0x464a5f)
+    if bs.read_flag():                # TargetMask (0x464a7e)
+        if bs.read_flag():            # mTargetSet (0x464ab2)
+            bs.read_bytes(4)          # mTarget F32 (0x464af0)
+    if bs.read_flag():                # WindowMask (0x464afd)
+        bs.read_bytes(4)              # mNodeBase (0x464b52)
+        count = int.from_bytes(bs.read_bytes(4), "little")  # mNodeCount (0x464b6a)
+        if count < (1 << 31):         # signed jle @0x464b7b: loop only if > 0
+            if count > (1 << 20):
+                raise GhostDecodeError(18, "PathCamera spline node count overflow")
+            for _ in range(count):
+                _read_point3f(bs)     # knot position (0x464b95)
+                _read_planef(bs)      # knot rotation QuatF, 4 x read(4) (0x464b9f)
+                bs.read_bytes(4)      # knot speed (0x464bb2)
+                bs.read_int(2)        # knot type (0x464bc0)
+                bs.read_int(1)        # knot path (0x464bcc)
+    bs.read_flag()                    # trailing control flag (0x464beb)
+
+
+def _unpack_splash(bs: BitStream, is_new: bool) -> None:
+    """Splash::unpackUpdate (AoT @ VA 0x4be080; vtable 0x601e84 slot 0x4c):
+    GameBase::unpackUpdate (0x456da0) parent, then a single flag (@0x4be093):
+    if set -> Point3F(12B) initial position (0x4be0d7 -> +0x2b4, handed to the
+    setPosition helper 0x54eb90 which reads no bits). Identical to TGE
+    splash.cc::unpackUpdate."""
+    _unpack_game_base(bs, is_new)     # parent (0x456da0)
+    if bs.read_flag():                # (0x4be093)
+        telemetry.emit_point3f("position", _read_point3f(bs))  # (0x4be0d7)
+
+
+def _unpack_fx_light(bs: BitStream, is_new: bool) -> None:
+    """fxLight::unpackUpdate (AoT @ VA 0x4acc20; vtable 0x5ffdb4 slot 0x4c).
+
+    GameBase::unpackUpdate (0x456da0) parent, then TWO flag-gated blocks
+    (CFG-followed 0x4acc38..0x4acd96):
+
+      flag A (@0x4acc38, attach block): if set ->
+          flag (@0x4acc75 -> byte +0x2cc, "attached" bool); if THAT set ->
+              readInt(getBinLog2(getNextPow2(0x4001))=15) attached ghost id
+              (0x4accc0; resolved via the connection helper 0x549380 + dynamic
+              cast 0x5ca107 -- no further reads either way);
+      flag B (@0x4acd04, transform block): if set ->
+          Box6F (193 bits, 0x421800 @0x4acd3d);
+          read(1) BYTE -> bool +0x2d6 (0x4acd4d);
+          read(4)      -> +0x2d8 (0x4acd6e);
+          (setTransform [vtbl+0x70] + local rebuild 0x4ac1c0 -- no reads)."""
+    _unpack_game_base(bs, is_new)     # parent (0x456da0)
+    if bs.read_flag():                # flag A attach (0x4acc38)
+        if bs.read_flag():            # attached bool +0x2cc (0x4acc75)
+            bs.read_int(15)           # attached ghost id (0x4accc0)
+    if bs.read_flag():                # flag B transform (0x4acd04)
+        _emit_box6f_position(_read_box6f(bs))  # light box (0x4acd3d)
+        bs.read_bytes(1)              # read(1) byte -> bool +0x2d6 (0x4acd4d)
+        bs.read_bytes(4)              # +0x2d8 (0x4acd6e)
+
+
+def _unpack_vehicle_blocker(bs: BitStream, is_new: bool) -> None:
+    """VehicleBlocker::unpackUpdate (AoT @ VA 0x4d0c50; vtable 0x6048cc slot
+    0x4c). AoT-custom (no TGE source) -- pure disassembly. Parent 0x485790
+    (bare ``ret 8``, 0 bits), then THREE unconditional reads, no mask:
+
+      matrix (64B, 0x465750 @0x4d0c6d)   mObjToWorld;
+      Point3F (12B, 0x421240 @0x4d0c78)  mObjScale (handed to [vtbl+0x74]);
+      Point3F (12B, 0x421240 @0x4d0c85)  mDimensions (-> +0x24c; the FP tail
+                                          builds the blocker's convex box).
+    Total = 704 bits, always."""
+    _emit_matrix_position(_read_matrix(bs))  # mObjToWorld (0x4d0c6d)
+    telemetry.emit_point3f("scale", _read_point3f(bs))  # mObjScale (0x4d0c78)
+    _read_point3f(bs)                 # mDimensions +0x24c (0x4d0c85)
+
+
+def _unpack_tw_surface_reference(bs: BitStream, is_new: bool) -> None:
+    """twSurfaceReference::unpackUpdate (AoT @ VA 0x4bfe50; vtable 0x6021d4 slot
+    0x4c). AoT-custom (no TGE source) -- pure disassembly. Parent 0x485790
+    (bare ``ret 8``, 0 bits), then a single master flag (inline readFlag
+    @0x4bfe66..0x4bfe9d; ``je 0x4bff42`` end if clear). If set:
+
+      Box6F (193 bits, 0x421800 @0x4bfeaa)  the surface area box;
+      read(4)  -> +0x260 (0x4bfeba);
+      flag     -> byte +0x264 (inline @0x4bfec7..0x4bfef7);
+      read(4)  -> +0x268 (0x4bff0a);
+      ColorF (4B, 0x4243f0 @0x4bff20) -> +0x26c;
+      (setTransform [vtbl+0x70] + conditional local rebuild 0x4bfc30, gated on
+      the non-wire byte +0x24c -- no bitstream reads)."""
+    if not bs.read_flag():            # master flag (0x4bfe66 -> je 0x4bff42)
+        return
+    _emit_box6f_position(_read_box6f(bs))  # surface box (0x4bfeaa)
+    bs.read_bytes(4)                  # +0x260 (0x4bfeba)
+    bs.read_flag()                    # +0x264 (0x4bfec7)
+    bs.read_bytes(4)                  # +0x268 (0x4bff0a)
+    _read_colorf(bs)                  # +0x26c (0x4bff20)
+
+
 def _unpack_sky(bs: BitStream, is_new: bool) -> None:
     """Sky::unpackUpdate (AoT @ VA 0x55c1b0). No parent. CFG-followed
     0x55c1b0..0x55cc0c.
@@ -1355,7 +1589,17 @@ def _unpack_projectile(bs: BitStream, is_new: bool) -> None:
                                         (getNextPow2(0x4001)=0x8000 -> 15, @0x476e06),
                                         readInt(3) (getNextPow2(8)=8 -> 3, @0x476e24);
       flag D (@0x476e8e): if set -> Point3F(12B), Point3F(12B), read(4)
-                                    (position + velocity + a U32, 0x476e9f..0x476ebd).
+                                    (explosion position + normal + collideHitType
+                                    U32, 0x476e9f..0x476ebd);
+      flag E (@0x476f13): if set -> Point3F(12B), Point3F(12B)
+                                    (bounce update: mCurrPosition -> +0x274
+                                    @0x476f26, mCurrVelocity -> +0x280 @0x476f33).
+
+    WAVE-20 FIX: prior transcription stopped after flag D; the function has a
+    THIRD mask block (TGE "bounce update"). The 0x476edf..0x476f38 tail reads
+    one more inline flag (setne cl @0x476f13) unconditionally on every
+    unpackUpdate, plus 2x readPoint3F when set -- its omission under-read every
+    Projectile update by 1 bit (193 bits when a bounce was packed).
     """
     _unpack_game_base(bs, is_new)         # parent (0x456da0)
     if bs.read_flag():                    # flag A (0x476c34)
@@ -1369,30 +1613,53 @@ def _unpack_projectile(bs: BitStream, is_new: bool) -> None:
         if bs.read_flag():                # flag C (0x476ddc)
             bs.read_int(15)               # (0x476e06)
             bs.read_int(3)                # (0x476e24)
-    if bs.read_flag():                    # flag D (0x476e8e)
+    if bs.read_flag():                    # flag D "explosion" (0x476e8e)
         telemetry.emit_point3f("position", _read_point3f(bs))  # (0x476e9f)
-        _read_point3f(bs)                 # velocity (0x476eaa)
-        bs.read_bytes(4)                  # read(4) U32 (0x476ebd)
+        _read_point3f(bs)                 # explosion normal (0x476eaa)
+        bs.read_bytes(4)                  # collideHitType U32 (0x476ebd)
+    if bs.read_flag():                    # flag E "bounce" (0x476f13)
+        telemetry.emit_point3f("position", _read_point3f(bs))  # mCurrPosition (0x476f26)
+        _read_point3f(bs)                 # mCurrVelocity (0x476f33)
 
 
 def _unpack_precipitation(bs: BitStream, is_new: bool) -> None:
     """Precipitation::unpackUpdate (AoT @ VA 0x4bbf70). CFG-followed
-    0x4bbf70..0x4bc143:
+    0x4bbf70..0x4bc229 (``ret 8``):
 
       GameBase::unpackUpdate (0x456da0: pos mask + datablock mask);
-      flag (@0x4bbfc6): if set ->
-          9 x read(4)   (storm params -> +0x4fc..+0x520, 0x4bbfe2..0x4bc0a2);
-          3 x flag      (+0x524/+0x525/+0x526, 0x4bc0c6/0x4bc0fc/0x4bc130).
+      flag1 (@0x4bbfb1..0x4bbfce inline): if set ->
+          9 x read(4)   (storm params -> +0x4fc,+0x504,+0x508,+0x514,+0x518,
+                         +0x50c,+0x510,+0x51c,+0x520; 0x4bbfe2..0x4bc0a2);
+          3 x flag      (+0x524/+0x525/+0x526, 0x4bc0be/0x4bc0f2/0x4bc126);
+      flag2 (@0x4bc157 inline): if set -> read(4)  (+0x500, 0x4bc18c);
+      flag3 (@0x4bc1a7 inline): if set -> 2 x read(4)  ([esp+0x14]/[esp+0x18],
+          0x4bc1dc/0x4bc1ea, handed to the clamp helper 0x4bb750 -- FP only,
+          reads no bits).
+
+    WAVE-21 FIX (the last bad_login residual, line 2406 / seq 261): the prior
+    transcription ended after flag1's 3 toggle bits, but the flag1-CLEAR branch
+    jumps to 0x4bc14a (flag2), NOT the epilogue -- flag2 and flag3 are read on
+    EVERY update. In the capture flag2 is SET (+0x500 = 1.0f) and flag3 clear,
+    so the decode under-read by 34 bits; the misaligned tail then fabricated a
+    "Camera ghost 0 update" (controlled-flag 0) out of the leftover bits. With
+    the tail read, the packet ends on the ghost-loop terminator with only the
+    6-bit byte pad left. The trailing 0x4bc1fe..0x4bc220 block is FP recompute
+    (fild +0x4fc * +0x500) -- no bitstream reads.
 
     Precipitation carries no transform of its own (it follows the camera); only
-    storm parameters + 3 toggle bits."""
+    storm parameters + toggle bits."""
     _unpack_game_base(bs, is_new)     # parent (0x456da0)
-    if bs.read_flag():                # (0x4bbfc6)
+    if bs.read_flag():                # flag1 (0x4bbfb1)
         for _ in range(9):
             bs.read_bytes(4)          # 9 x read(4) (0x4bbfe2..0x4bc0a2)
-        bs.read_flag()                # +0x524 (0x4bc0c6)
-        bs.read_flag()                # +0x525 (0x4bc0fc)
-        bs.read_flag()                # +0x526 (0x4bc130)
+        bs.read_flag()                # +0x524 (0x4bc0be)
+        bs.read_flag()                # +0x525 (0x4bc0f2)
+        bs.read_flag()                # +0x526 (0x4bc126)
+    if bs.read_flag():                # flag2 (0x4bc157)
+        bs.read_bytes(4)              # +0x500 (0x4bc18c)
+    if bs.read_flag():                # flag3 (0x4bc1a7)
+        bs.read_bytes(4)              # [esp+0x14] (0x4bc1dc)
+        bs.read_bytes(4)              # [esp+0x18] (0x4bc1ea) -> 0x4bb750 (0 bits)
 
 
 def _unpack_player(bs: BitStream, is_new: bool) -> None:
@@ -1556,17 +1823,55 @@ DECODERS: dict = {
     "MazeSpawner": _unpack_mission_marker,  # 0x4638a0 = jmp 0x463620
     "DestructableSpawner": _unpack_destructable_spawner,  # 0x4639e0
     "GoldSpawner": _unpack_gold_spawner,    # 0x4638b0
+    # Final wave: the last 7 classes (vtables resolved regthunk -> ClassRep ->
+    # create -> objVtable slot 0x4c; resolver re-validated against the known
+    # Player 0x46e690 / ShapeBase 0x483d90 / FlyingVehicle 0x4c7c10 VAs).
+    "FlyingVehicle": _unpack_flying_vehicle,        # 0x4c7c10
+    "WheeledVehicle": _unpack_wheeled_vehicle,      # 0x4d2430
+    "PathCamera": _unpack_path_camera,              # 0x4649c0
+    "Splash": _unpack_splash,                       # 0x4be080
+    "fxLight": _unpack_fx_light,                    # 0x4acc20
+    "VehicleBlocker": _unpack_vehicle_blocker,      # 0x4d0c50
+    "twSurfaceReference": _unpack_tw_surface_reference,  # 0x4bfe50
 }
 
 
 # --------------------------------------------------------------------------- #
-# Control/camera-object readPacketData (NetObject vtable slot 0xec).
+# Control/camera-object readPacketData (vtable slot 0xec).
 #
 # GameConnection::readPacket dispatches the control object's readPacketData on
 # the RESOLVED ghost's actual class (call [edx+0xec] @ 0x459593). ShapeBase
 # provides the shared 8-byte base (0x47e210); ShapeBase subclasses (Camera,
-# Player, ...) OVERRIDE it with a larger payload. We must call the right one or
-# the rest of the packet (ghost section) desyncs.
+# Player, Vehicle...) OVERRIDE it with a larger payload. We must call the right
+# one or the rest of the packet (ghost section) desyncs.
+#
+# FULL 50-CLASS SLOT-0xec SWEEP (regthunk -> ClassRep ctor -> ClassRep
+# vtbl[0x04]=create -> object ctor -> object vtable; every class's slot 0x4c
+# cross-checked OK against the EXE-proven unpackUpdate table above, so each
+# vtable resolution is individually validated; Projectile's thunk uses a
+# different codegen shape, its vtable 0x5faf14 was pinned by scanning .rdata
+# for slot 0x4c == 0x476bf0). Canonical slot-0xec groups:
+#
+#   0x44e680 Camera::readPacketData          Camera
+#   0x4699d0 Player::readPacketData          Player, AIPlayer
+#   0x4ce0c0 Vehicle::readPacketData         HoverVehicle (inherited unchanged)
+#   0x4c7300 FlyingVehicle::readPacketData   FlyingVehicle (= Vehicle + 0-bit tail)
+#   0x4d20e0 WheeledVehicle::readPacketData  WheeledVehicle
+#   0x47e210 ShapeBase::readPacketData       ShapeBase, StaticShape,
+#            ScopeAlwaysShape, Item, MissionMarker, NPCSpawner, MazeSpawner,
+#            RoomMarker, DestructableSpawner, GoldSpawner, SpawnSphere,
+#            WayPoint, PathCamera
+#   0x485790 GameBase::readPacketData        (the shared bare ``ret 8`` stub =
+#            ZERO bits) GameBase, Debris, Lightning, ParticleEmitterNode,
+#            PathedInterior, Precipitation, Projectile, Splash, Trigger, fxLight
+#   (no slot 0xec -- vtable ends at 53/21 slots, before 0xec/4=59; these are
+#    SceneObject/NetObject-only classes and CANNOT be a control object --
+#    GameConnection::setControlObject takes a GameBase*): AudioEmitter,
+#    InteriorInstance, Marker, MissionArea, PhysicalZone, SimpleNetObject, Sky,
+#    Sun, TSStatic, TerrainBlock, VehicleBlocker, WaterBlock, fxBrickBatcher,
+#    fxDTSBrick, fxFoliageReplicator, fxGrassReplicator,
+#    fxShapeReplicatedStatic, fxShapeReplicator, fxSunLight,
+#    twSurfaceReference, volumeLight.
 # --------------------------------------------------------------------------- #
 
 
@@ -1575,6 +1880,90 @@ def _read_packet_data_shapebase(bs: BitStream) -> None:
     0 bits) + 2 x read(4) = 8 raw bytes (a control angle F32 + an F32). Shared by
     every ShapeBase subclass that does not override slot 0xec."""
     bs.read_bytes(8)
+
+
+def _read_packet_data_gamebase(bs: BitStream) -> None:
+    """GameBase::readPacketData (AoT @ VA 0x485790: the shared bare ``ret 8``
+    stub) -- reads ZERO bits. This is slot 0xec for every GameBase-derived,
+    non-ShapeBase class (Projectile/Precipitation/Trigger/Splash/Lightning/
+    Debris/ParticleEmitterNode/PathedInterior/fxLight/GameBase itself). If one
+    of these were ever the control object, the previous 8-byte ShapeBase
+    fallback would have over-read the control header by 64 bits."""
+    return
+
+
+def _read_packet_data_vehicle(bs: BitStream) -> None:
+    """Vehicle::readPacketData (AoT @ VA 0x4ce0c0; HoverVehicle inherits slot
+    0xec == 0x4ce0c0 unchanged). CFG-followed 0x4ce0c0..0x4ce229 (``ret 8``):
+
+      ShapeBase::readPacketData (0x47e210, 8 bytes);
+      read(4)            -> +0xb70   (0x4ce0df);
+      read(4)            -> +0xb74   (0x4ce0f7);
+      Point3F (12B)      -> +0x21bc  (0x4ce110, mathRead 0x421240) position;
+      PlaneF  (16B)      -> +0x21e0  (0x4ce11d, 0x4656d0) rotation QuatF;
+      Point3F (12B)      -> +0x21c8  (0x4ce12a) velocity;
+      Point3F (12B)      -> +0x21f0  (0x4ce137) angular velocity;
+      inline flag        -> +0x22e4  (0x4ce151);
+      inline flag        (0x4ce18d; set-path only zeroes [+0x168c], no payload);
+      (3 calls on the +0x2198 interp buffer @0x4ce1c9/0x4ce1d0/0x4ce1d7 --
+       ecx-only, the stream is never passed, 0 bits);
+      inline flag        -> +0xb7d   (0x4ce1ec);
+      (0x421170 tail = the connection memcpy, NOT a bitstream read).
+
+    Total = 68 bytes + 3 flags = 547 bits, always. Mirrors TGE vehicle.cc
+    readPacketData (delta pos/rot/vel/angVel + atRest/collision flags)."""
+    _read_packet_data_shapebase(bs)   # 0x47e210 (8 bytes)
+    bs.read_bytes(4)                  # +0xb70 (0x4ce0df)
+    bs.read_bytes(4)                  # +0xb74 (0x4ce0f7)
+    _read_point3f(bs)                 # +0x21bc position (0x4ce110)
+    _read_planef(bs)                  # +0x21e0 rotation QuatF (0x4ce11d)
+    _read_point3f(bs)                 # +0x21c8 velocity (0x4ce12a)
+    _read_point3f(bs)                 # +0x21f0 angular velocity (0x4ce137)
+    bs.read_flag()                    # +0x22e4 (0x4ce151)
+    bs.read_flag()                    # (0x4ce18d) zeroes [+0x168c] if set
+    bs.read_flag()                    # +0xb7d (0x4ce1ec)
+
+
+def _read_packet_data_flying_vehicle(bs: BitStream) -> None:
+    """FlyingVehicle::readPacketData (AoT @ VA 0x4c7300; vtable 0x6039a4 slot
+    0xec). Vehicle::readPacketData (0x4ce0c0) parent, then a BIT-FREE tail:
+    ``call 0x4cefd0`` receives only &this->0x21bc / &this->0x21e0 (the values
+    the parent already read; the stream is never passed) and the rest is field
+    copies (0x4c732b..0x4c735b). Wire-identical to Vehicle."""
+    _read_packet_data_vehicle(bs)     # parent (0x4ce0c0); tail reads 0 bits
+
+
+def _read_packet_data_wheeled_vehicle(bs: BitStream) -> None:
+    """WheeledVehicle::readPacketData (AoT @ VA 0x4d20e0; vtable 0x604bc4 slot
+    0xec). CFG-followed 0x4d20e0..ret:
+
+      Vehicle::readPacketData (0x4ce0c0);
+      inline flag        -> +0x237c mBraking (0x4d210c);
+      wheelCount x [ read(4) wheel->avel (+0x10, 0x4d216e);
+                     read(4) wheel->Dy   (+0x18, 0x4d2183);
+                     read(4) wheel->Dx   (+0x1c, 0x4d2198);
+                     inline flag wheel->slipping (+0x51, 0x4d21b2) ]
+        (loop bound = mDataBlock->wheelCount [db+0x500] @0x4d213e, wheel stride
+         0x60, base +0x2390 -- the same NON-wire .dts-derived count as
+         unpackUpdate; see :data:`WHEELED_VEHICLE_WHEEL_COUNT`);
+      (0x4cefd0 + field copies tail -- 0 bits, as in FlyingVehicle).
+
+    Mirrors TGE wheeledVehicle.cc readPacketData (brake flag + per-wheel
+    avel/Dy/Dx/slip)."""
+    _read_packet_data_vehicle(bs)     # parent (0x4ce0c0)
+    bs.read_flag()                    # mBraking +0x237c (0x4d210c)
+    if WHEELED_VEHICLE_WHEEL_COUNT is None:
+        raise GhostDecodeError(
+            39,
+            "WheeledVehicle readPacketData wheel loop but wheelCount unknown "
+            "(mDataBlock->wheelCount is .dts-derived, not on the wire; set "
+            "ghosts.WHEELED_VEHICLE_WHEEL_COUNT)",
+        )
+    for _ in range(WHEELED_VEHICLE_WHEEL_COUNT):
+        bs.read_bytes(4)              # wheel->avel (0x4d216e)
+        bs.read_bytes(4)              # wheel->Dy (0x4d2183)
+        bs.read_bytes(4)              # wheel->Dx (0x4d2198)
+        bs.read_flag()                # wheel->slipping (0x4d21b2)
 
 
 def _read_packet_data_camera(bs: BitStream) -> None:
@@ -1652,11 +2041,45 @@ def _read_packet_data_player(bs: BitStream) -> None:
         _read_packet_data_shapebase(bs)
 
 
-# class name -> control-object readPacketData (slot 0xec) decoder.
+# class name -> control-object readPacketData (slot 0xec) decoder. TOTAL over
+# every GameBase-derived class (the only classes setControlObject accepts); see
+# the sweep table above. Classes NOT listed here are the SceneObject-only ones
+# with no slot 0xec at all -- they can never be a control object, and the
+# read_packet_data fallback (ShapeBase 8-byte) only ever applies to a ghost
+# whose class we have not yet learned.
 PACKET_DATA_DECODERS: dict = {
-    "Camera": _read_packet_data_camera,
-    "Player": _read_packet_data_player,
-    "AIPlayer": _read_packet_data_player,  # shares slot 0xec == 0x4699d0
+    # overrides
+    "Camera": _read_packet_data_camera,             # 0x44e680
+    "Player": _read_packet_data_player,             # 0x4699d0
+    "AIPlayer": _read_packet_data_player,           # shares slot 0xec == 0x4699d0
+    "HoverVehicle": _read_packet_data_vehicle,      # 0x4ce0c0 (Vehicle's, inherited)
+    "FlyingVehicle": _read_packet_data_flying_vehicle,    # 0x4c7300
+    "WheeledVehicle": _read_packet_data_wheeled_vehicle,  # 0x4d20e0
+    # ShapeBase base group (slot 0xec == 0x47e210, 8 bytes)
+    "ShapeBase": _read_packet_data_shapebase,
+    "StaticShape": _read_packet_data_shapebase,
+    "ScopeAlwaysShape": _read_packet_data_shapebase,
+    "Item": _read_packet_data_shapebase,
+    "MissionMarker": _read_packet_data_shapebase,
+    "NPCSpawner": _read_packet_data_shapebase,
+    "MazeSpawner": _read_packet_data_shapebase,
+    "RoomMarker": _read_packet_data_shapebase,
+    "DestructableSpawner": _read_packet_data_shapebase,
+    "GoldSpawner": _read_packet_data_shapebase,
+    "SpawnSphere": _read_packet_data_shapebase,
+    "WayPoint": _read_packet_data_shapebase,
+    "PathCamera": _read_packet_data_shapebase,
+    # GameBase stub group (slot 0xec == 0x485790 bare ret 8, ZERO bits)
+    "GameBase": _read_packet_data_gamebase,
+    "Debris": _read_packet_data_gamebase,
+    "Lightning": _read_packet_data_gamebase,
+    "ParticleEmitterNode": _read_packet_data_gamebase,
+    "PathedInterior": _read_packet_data_gamebase,
+    "Precipitation": _read_packet_data_gamebase,
+    "Projectile": _read_packet_data_gamebase,
+    "Splash": _read_packet_data_gamebase,
+    "Trigger": _read_packet_data_gamebase,
+    "fxLight": _read_packet_data_gamebase,
 }
 
 
@@ -1671,9 +2094,10 @@ def read_packet_data(bs: BitStream, class_id: int | None) -> None:
     """
     if class_id is None:
         # Unknown control object class: default to the shared ShapeBase 8-byte
-        # readPacketData. This is the correct base for ShapeBase and every
-        # subclass that does not override slot 0xec; only Camera/Player (tracked
-        # via _ghost_classes once scoped) need the larger override.
+        # readPacketData. Every class that can be a control object is mapped in
+        # PACKET_DATA_DECODERS (total over the GameBase-derived classes); this
+        # fallback only applies before the ghost's class has been learned, where
+        # ShapeBase is the overwhelmingly likely base (Camera pre-login).
         _read_packet_data_shapebase(bs)
         return
     name = (

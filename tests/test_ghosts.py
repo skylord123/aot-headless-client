@@ -408,15 +408,20 @@ def test_interior_instance_normal_update_no_transform():
     assert rs.get_bit_position() == 5
 
 
-def test_unported_class_raises():
-    # FlyingVehicle has no decoder yet: its master-flag gate reads a NON-wire
-    # member field [this+0x274], so it cannot be reproduced from the stream (it is
-    # only reached downstream of other content and never cleanly in the captures).
+def test_all_object_classes_have_decoders():
+    # Final wave: every one of the 50 object classes has an unpackUpdate decoder.
+    missing = [n for n in gh.OBJECT_CLASS_NAMES if n not in gh.DECODERS]
+    assert missing == []
+
+
+def test_out_of_range_class_still_raises():
+    # A classId >= 50 is impossible from an unchanged server (proof of an
+    # upstream misalignment); unpack_update must still raise with the id.
     bs = BitStream()
     bs.write_flag(True)
     rs = BitStream(bs.get_bytes())
     with pytest.raises(gh.GhostDecodeError):
-        gh.unpack_update(rs, gh.OBJECT_CLASS_NAMES.index("FlyingVehicle"), is_new=True)
+        gh.unpack_update(rs, 58, is_new=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -569,3 +574,322 @@ def test_terrain_block_flag1_clear_flag2_set():
         bs.write_flag(True)    # flag2 set
         bs.write_bytes(b"\x00" * 4)  # count = 0
     assert _decode("TerrainBlock", w) == 1 + 1 + 32
+
+
+# --------------------------------------------------------------------------- #
+# Final wave: the last 7 unported classes (vtable slot 0x4c resolved via
+# regthunk -> ClassRep -> create -> objVtable):
+#   FlyingVehicle 0x4c7c10, WheeledVehicle 0x4d2430, PathCamera 0x4649c0,
+#   Splash 0x4be080, fxLight 0x4acc20, VehicleBlocker 0x4d0c50,
+#   twSurfaceReference 0x4bfe50.
+# --------------------------------------------------------------------------- #
+
+
+def test_splash_clear_and_set():
+    # GameBase (2 clear flags) + Splash flag(0) = 3 bits.
+    def w0(bs):
+        for _ in range(3):
+            bs.write_flag(False)
+    assert _decode("Splash", w0) == 3
+    # GameBase (2 clear) + flag(1) + Point3F(96) = 99 bits.
+    def w1(bs):
+        bs.write_flag(False); bs.write_flag(False)
+        bs.write_flag(True)
+        bs.write_bytes(b"\x00" * 12)
+    assert _decode("Splash", w1) == 2 + 1 + 96
+
+
+def test_vehicle_blocker_unconditional_704_bits():
+    # No mask at all: matrix(512) + Point3F(96) scale + Point3F(96) dims.
+    def w(bs):
+        bs.write_bytes(b"\x00" * (64 + 12 + 12))
+    assert _decode("VehicleBlocker", w) == 704
+
+
+def test_tw_surface_reference_clear_and_set():
+    # master flag clear -> 1 bit.
+    assert _decode("twSurfaceReference", lambda bs: bs.write_flag(False)) == 1
+    # master(1) + Box6F(193) + read4(32) + flag(1) + read4(32) + ColorF(32).
+    def w(bs):
+        bs.write_flag(True)
+        bs.write_bytes(b"\x00" * 24); bs.write_flag(False)  # Box6F = 193
+        bs.write_bytes(b"\x00" * 4)    # +0x260
+        bs.write_flag(False)           # +0x264
+        bs.write_bytes(b"\x00" * 4)    # +0x268
+        bs.write_bytes(b"\x00" * 4)    # ColorF
+    assert _decode("twSurfaceReference", w) == 1 + 193 + 32 + 1 + 32 + 32
+
+
+def test_fx_light_all_clear():
+    # GameBase (2 clear) + flag A(0) + flag B(0) = 4 bits.
+    def w(bs):
+        for _ in range(4):
+            bs.write_flag(False)
+    assert _decode("fxLight", w) == 4
+
+
+def test_fx_light_attach_and_transform():
+    # A(1) + inner(1) + readInt(15) ghost id; B(1) + Box6F(193) + read(1)byte(8)
+    # + read4(32).
+    def w(bs):
+        bs.write_flag(False); bs.write_flag(False)   # GameBase clear
+        bs.write_flag(True)            # flag A
+        bs.write_flag(True)            # attached
+        bs.write_int(123, 15)          # attached ghost id
+        bs.write_flag(True)            # flag B
+        bs.write_bytes(b"\x00" * 24); bs.write_flag(False)  # Box6F = 193
+        bs.write_bytes(b"\x00")        # read(1) byte
+        bs.write_bytes(b"\x00" * 4)    # read(4)
+    assert _decode("fxLight", w) == 2 + 1 + 1 + 15 + 1 + 193 + 8 + 32
+
+
+def test_path_camera_all_clear():
+    # ShapeBase (3 clear) + 4 mask flags clear + unconditional trailing flag
+    # = 3 + 5 = 8 bits.
+    def w(bs):
+        for _ in range(8):
+            bs.write_flag(False)
+    assert _decode("PathCamera", w) == 8
+
+
+def test_path_camera_spline_window():
+    # WindowMask with 2 knots: each knot = Point3F(96) + QuatF(128) + read4(32)
+    # + readInt(2) + readInt(1) = 259 bits.
+    def w(bs):
+        for _ in range(3):
+            bs.write_flag(False)       # ShapeBase parent clear
+        bs.write_flag(False)           # StateMask
+        bs.write_flag(False)           # PositionMask
+        bs.write_flag(False)           # TargetMask
+        bs.write_flag(True)            # WindowMask
+        bs.write_bytes(b"\x00" * 4)    # mNodeBase
+        bs.write_bytes((2).to_bytes(4, "little"))  # mNodeCount = 2
+        for _ in range(2):
+            bs.write_bytes(b"\x00" * 12)   # knot position
+            bs.write_bytes(b"\x00" * 16)   # knot rotation QuatF
+            bs.write_bytes(b"\x00" * 4)    # knot speed
+            bs.write_int(1, 2)             # knot type
+            bs.write_int(0, 1)             # knot path
+        bs.write_flag(False)           # trailing control flag
+    assert _decode("PathCamera", w) == 3 + 4 + 32 + 32 + 2 * (96 + 128 + 32 + 3) + 1
+
+
+def test_path_camera_negative_node_count_skips_loop():
+    # The exe's loop bound is a SIGNED jle: a "negative" count reads no knots.
+    def w(bs):
+        for _ in range(3):
+            bs.write_flag(False)
+        bs.write_flag(False); bs.write_flag(False); bs.write_flag(False)
+        bs.write_flag(True)            # WindowMask
+        bs.write_bytes(b"\x00" * 4)    # mNodeBase
+        bs.write_bytes((0xFFFFFFFF).to_bytes(4, "little"))  # mNodeCount = -1
+        bs.write_flag(False)           # trailing flag
+    assert _decode("PathCamera", w) == 3 + 4 + 32 + 32 + 1
+
+
+def test_flying_vehicle_tail_after_vehicle_master_set():
+    # Vehicle: ShapeBase(3 clear) + flag A(0) + master B(1) -> Vehicle returns;
+    # FlyingVehicle tail (non-control object): createHeightOn flag +
+    # readInt(3) thrust = 3+1+1+1+3 = 9 bits.
+    def w(bs):
+        for _ in range(3):
+            bs.write_flag(False)   # ShapeBase parent clear
+        bs.write_flag(False)       # Vehicle flag A
+        bs.write_flag(True)        # Vehicle master B -> return
+        bs.write_flag(True)        # createHeightOn
+        bs.write_int(5, 3)         # mThrustDirection
+    assert _decode("FlyingVehicle", w) == 3 + 1 + 1 + 1 + 3
+
+
+def test_wheeled_vehicle_no_wheel_blocks():
+    # Vehicle (master set = 5 bits) + W1(0) + W2(0) + braking(1 bit) + W4(0)
+    # = 5 + 4 = 9 bits. No wheel count needed on this path.
+    def w(bs):
+        for _ in range(3):
+            bs.write_flag(False)   # ShapeBase parent
+        bs.write_flag(False)       # Vehicle flag A
+        bs.write_flag(True)        # Vehicle master B -> return
+        bs.write_flag(False)       # W1 wheel datablocks
+        bs.write_flag(False)       # W2 control suppression
+        bs.write_flag(True)        # mBraking
+        bs.write_flag(False)       # W4 wheel motion
+    assert _decode("WheeledVehicle", w) == 9
+
+
+def test_wheeled_vehicle_w2_set_returns():
+    # W2 SET -> immediate return: 5 + 1 + 1 = 7 bits.
+    def w(bs):
+        for _ in range(3):
+            bs.write_flag(False)
+        bs.write_flag(False)       # Vehicle flag A
+        bs.write_flag(True)        # Vehicle master B
+        bs.write_flag(False)       # W1
+        bs.write_flag(True)        # W2 -> return
+    assert _decode("WheeledVehicle", w) == 7
+
+
+def test_wheeled_vehicle_wheel_blocks_with_known_count(monkeypatch):
+    # With the .dts-derived wheel count supplied, both wheel loops decode:
+    # W1: 2 x [flag(1) + tire int10 + spring int10 + powered flag + steering
+    # read4] = 2 x 54; W4: 2 x 3 x read4 = 192.
+    monkeypatch.setattr(gh, "WHEELED_VEHICLE_WHEEL_COUNT", 2)
+    def w(bs):
+        for _ in range(3):
+            bs.write_flag(False)
+        bs.write_flag(False)       # Vehicle flag A
+        bs.write_flag(True)        # Vehicle master B
+        bs.write_flag(True)        # W1 set
+        for _ in range(2):
+            bs.write_flag(True)    # wheel present
+            bs.write_int(7, 10)    # tire db id
+            bs.write_int(9, 10)    # spring db id
+            bs.write_flag(True)    # powered
+            bs.write_bytes(b"\x00" * 4)  # steering
+        bs.write_flag(False)       # W2
+        bs.write_flag(False)       # mBraking
+        bs.write_flag(True)        # W4 set
+        for _ in range(2):
+            bs.write_bytes(b"\x00" * 12)  # avel/Dy/Dx
+    assert _decode("WheeledVehicle", w) == 5 + 1 + 2 * 54 + 1 + 1 + 1 + 2 * 96
+
+
+def test_wheeled_vehicle_unknown_count_raises():
+    # Wheel block present but wheelCount unknown (the live default): the decoder
+    # must raise GhostDecodeError (containment) rather than guess a loop count.
+    assert gh.WHEELED_VEHICLE_WHEEL_COUNT is None
+    bs = BitStream()
+    for _ in range(3):
+        bs.write_flag(False)
+    bs.write_flag(False)           # Vehicle flag A
+    bs.write_flag(True)            # Vehicle master B
+    bs.write_flag(True)            # W1 set -> needs wheelCount
+    rs = BitStream(bs.get_bytes())
+    with pytest.raises(gh.GhostDecodeError):
+        gh.DECODERS["WheeledVehicle"](rs, True)
+
+
+# --------------------------------------------------------------------------- #
+# Precipitation unpackUpdate tail (flag2/flag3, VA 0x4bc14a..0x4bc1fe) -- the
+# bad_login line-2406 / seq-261 23-bit-residual fix.
+# --------------------------------------------------------------------------- #
+
+
+def test_precipitation_all_clear():
+    # GameBase(2 clear) + flag1(0) + flag2(0) + flag3(0) = 5 bits. flag2/flag3
+    # are read on EVERY update (the flag1-clear branch jumps to 0x4bc14a, not
+    # the epilogue).
+    def w(bs):
+        for _ in range(5):
+            bs.write_flag(False)
+    assert _decode("Precipitation", w) == 5
+
+
+def test_precipitation_flag2_only():
+    # The exact seq-261 shape: flag1 block + flag2 SET (+0x500 F32) + flag3
+    # clear. GameBase(1+96+1+10) + flag1(1+288+3) + flag2(1+32) + flag3(1).
+    def w(bs):
+        bs.write_flag(True)               # GameBase scale mask
+        bs.write_bytes(b"\x00" * 12)      # Point3F
+        bs.write_flag(True)               # GameBase datablock mask
+        bs.write_int(284, 10)             # datablock id
+        bs.write_flag(True)               # flag1
+        bs.write_bytes(b"\x00" * 36)      # 9 x read(4)
+        bs.write_flag(False)              # +0x524
+        bs.write_flag(False)              # +0x525
+        bs.write_flag(True)               # +0x526
+        bs.write_flag(True)               # flag2
+        bs.write_bytes(b"\x00\x00\x80\x3f")  # +0x500 = 1.0f
+        bs.write_flag(False)              # flag3
+    assert _decode("Precipitation", w) == (1 + 96 + 1 + 10) + (1 + 288 + 3) + (1 + 32) + 1
+
+
+def test_precipitation_flag3_set():
+    # flag3 SET -> 2 x read(4) (the 0x4bb750 clamp args).
+    def w(bs):
+        for _ in range(3):
+            bs.write_flag(False)          # GameBase x2 + flag1
+        bs.write_flag(False)              # flag2
+        bs.write_flag(True)               # flag3
+        bs.write_bytes(b"\x00" * 8)       # 2 x read(4)
+    assert _decode("Precipitation", w) == 5 + 64
+
+
+# --------------------------------------------------------------------------- #
+# Control-object readPacketData (vtable slot 0xec) coverage -- the full-sweep
+# override table (Vehicle/FlyingVehicle/WheeledVehicle + GameBase 0-bit stub).
+# --------------------------------------------------------------------------- #
+
+
+def _decode_packet_data(class_name, write_fn):
+    bs = BitStream()
+    write_fn(bs)
+    rs = BitStream(bs.get_bytes())
+    gh.PACKET_DATA_DECODERS[class_name](rs)
+    assert not rs.error
+    return rs.get_bit_position()
+
+
+def test_packet_data_gamebase_stub_zero_bits():
+    # GameBase::readPacketData == 0x485790 bare ret 8: ZERO bits for every
+    # GameBase-derived non-ShapeBase class.
+    for cls in ("GameBase", "Debris", "Lightning", "ParticleEmitterNode",
+                "PathedInterior", "Precipitation", "Projectile", "Splash",
+                "Trigger", "fxLight"):
+        assert _decode_packet_data(cls, lambda bs: None) == 0
+
+
+def test_packet_data_vehicle_547_bits():
+    # Vehicle::readPacketData (0x4ce0c0): ShapeBase 8B + 2 x read(4) + Point3F +
+    # PlaneF(16B) + 2 x Point3F + 3 flags = 68 bytes + 3 bits = 547 bits, always.
+    def w(bs):
+        bs.write_bytes(b"\x00" * 68)
+        for _ in range(3):
+            bs.write_flag(True)
+    assert _decode_packet_data("HoverVehicle", w) == 547
+    # FlyingVehicle's override (0x4c7300) adds only a bit-free tail.
+    assert _decode_packet_data("FlyingVehicle", w) == 547
+
+
+def test_packet_data_wheeled_vehicle_with_count(monkeypatch):
+    # WheeledVehicle (0x4d20e0): Vehicle 547 + mBraking flag + wheelCount x
+    # [3 x read(4) + slip flag].
+    monkeypatch.setattr(gh, "WHEELED_VEHICLE_WHEEL_COUNT", 4)
+    def w(bs):
+        bs.write_bytes(b"\x00" * 68)
+        for _ in range(3):
+            bs.write_flag(False)
+        bs.write_flag(True)               # mBraking
+        for _ in range(4):
+            bs.write_bytes(b"\x00" * 12)  # avel/Dy/Dx
+            bs.write_flag(False)          # slipping
+    assert _decode_packet_data("WheeledVehicle", w) == 547 + 1 + 4 * 97
+
+
+def test_packet_data_wheeled_vehicle_unknown_count_raises():
+    assert gh.WHEELED_VEHICLE_WHEEL_COUNT is None
+    bs = BitStream()
+    bs.write_bytes(b"\x00" * 68)
+    for _ in range(4):
+        bs.write_flag(False)
+    rs = BitStream(bs.get_bytes())
+    with pytest.raises(gh.GhostDecodeError):
+        gh.PACKET_DATA_DECODERS["WheeledVehicle"](rs)
+
+
+def test_packet_data_decoders_cover_all_gamebase_classes():
+    # PACKET_DATA_DECODERS must be TOTAL over the GameBase-derived classes (the
+    # only legal control objects; GameConnection::setControlObject takes a
+    # GameBase*). The SceneObject-only classes have NO vtable slot 0xec.
+    scene_object_only = {
+        "AudioEmitter", "InteriorInstance", "Marker", "MissionArea",
+        "PhysicalZone", "SimpleNetObject", "Sky", "Sun", "TSStatic",
+        "TerrainBlock", "VehicleBlocker", "WaterBlock", "fxBrickBatcher",
+        "fxDTSBrick", "fxFoliageReplicator", "fxGrassReplicator",
+        "fxShapeReplicatedStatic", "fxShapeReplicator", "fxSunLight",
+        "twSurfaceReference", "volumeLight",
+    }
+    for name in gh.OBJECT_CLASS_NAMES:
+        if name in scene_object_only:
+            assert name not in gh.PACKET_DATA_DECODERS
+        else:
+            assert name in gh.PACKET_DATA_DECODERS, name

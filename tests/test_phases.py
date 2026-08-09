@@ -202,10 +202,12 @@ def test_read_ghost_section_empty_presence_consumes_one_bit():
     assert not rs.error
 
 
-def test_read_ghost_section_unported_class_raises():
+def test_read_ghost_section_undecodable_ghost_raises():
     # presence=1, idSize=readInt(4)+3, one ghost present (flag 1), id, not a
-    # remove (flag 0), NEW ghost -> readClassId(6) selects an object class with
-    # no ported unpackUpdate -> AlignmentError carrying the class.
+    # remove (flag 0), NEW ghost -> a ghost whose unpackUpdate cannot proceed
+    # (WheeledVehicle wheel block with the .dts-derived wheelCount unknown --
+    # every class now HAS a decoder, this is the remaining data-dependent gap)
+    # -> AlignmentError carrying the class.
     p = _make(track_objects=True)
     p.ghosting_active = True
     bs = BitStream()
@@ -214,7 +216,15 @@ def test_read_ghost_section_unported_class_raises():
     bs.write_flag(True)        # this ghost present
     bs.write_int(5, 3)         # ghost id (3-bit)
     bs.write_flag(False)       # not a remove
-    bs.write_int(5, 6)         # classId 5 == "FlyingVehicle" (no unpackUpdate yet)
+    bs.write_int(39, 6)        # classId 39 == "WheeledVehicle"
+    # WheeledVehicle::unpackUpdate: ShapeBase parent (3 clear flags) + Vehicle
+    # flag A(0) + Vehicle master B(1 -> return) + wheel-block flag W1 SET ->
+    # wheelCount unknown -> GhostDecodeError -> AlignmentError.
+    for _ in range(3):
+        bs.write_flag(False)   # ShapeBase parent all-clear
+    bs.write_flag(False)       # Vehicle flag A
+    bs.write_flag(True)        # Vehicle master B
+    bs.write_flag(True)        # W1 wheel block present
     rs = BitStream(bs.get_bytes())
     with pytest.raises(AlignmentError):
         p._read_ghost_section(rs)
@@ -269,9 +279,11 @@ def test_read_packet_body_event_desync_is_fatal():
 
 
 def test_read_packet_body_ghost_desync_is_not_fatal():
-    """An unported ghost class in the GHOST section raises AlignmentError with
+    """An undecodable ghost in the GHOST section raises AlignmentError with
     fatal=False: the event section was already consumed, so only that packet's
-    ghost updates are lost and the session stays usable."""
+    ghost updates are lost and the session stays usable. (Uses the remaining
+    real failure mode -- a WheeledVehicle wheel block with the .dts-derived
+    wheelCount unknown; every class now has a decoder.)"""
     p = _make(track_objects=True)
     p.ghosting_active = True
     bs = BitStream()
@@ -283,13 +295,18 @@ def test_read_packet_body_ghost_desync_is_not_fatal():
     # end-of-unguaranteed + end-of-guaranteed).
     for _ in range(2):
         bs.write_flag(False)
-    # ghost section: one NEW ghost of an unported class (5 == FlyingVehicle).
+    # ghost section: one NEW WheeledVehicle ghost whose wheel block blocks.
     bs.write_flag(True)        # presence
     bs.write_int(0, 4)         # idSize = 3
     bs.write_flag(True)        # ghost present
     bs.write_int(5, 3)         # ghost id
     bs.write_flag(False)       # not a remove
-    bs.write_int(5, 6)         # classId 5 (no unpackUpdate ported)
+    bs.write_int(39, 6)        # classId 39 == "WheeledVehicle"
+    for _ in range(3):
+        bs.write_flag(False)   # ShapeBase parent all-clear
+    bs.write_flag(False)       # Vehicle flag A
+    bs.write_flag(True)        # Vehicle master B -> return
+    bs.write_flag(True)        # W1 wheel block present -> wheelCount unknown
     rs = BitStream(bs.get_bytes())
     with pytest.raises(AlignmentError) as ei:
         p.read_packet_body(rs)

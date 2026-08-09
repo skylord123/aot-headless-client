@@ -239,6 +239,14 @@ class AotClient:
         # still arriving mid-teardown don't spawn duplicate disconnect tasks.
         # Rebuilt (False) on every reset()/reconnect.
         self._desync_abort_started = False
+        # NACK bookkeeping: current run of consecutive undecodable packet
+        # bodies, and per-cause totals for this connection (rate-limited logs).
+        self._body_fail_streak = 0
+        self._body_fail_counts: dict[str, int] = {}
+        # The pre-armed disconnect-reason text the server sends every client
+        # right after connect via MsgConnectionError (cosmetic; see
+        # _on_server_message).
+        self._server_connection_error_text = ""
         # True while auto-login is waiting for our username to free up: after a
         # crash+reconnect the PREVIOUS session's character can still be in-world
         # (the server hasn't timed the dead connection out yet), so logging in
@@ -357,24 +365,36 @@ class AotClient:
         # last_send_seq.
         self.phases.write_packet_body(bs, self.conn.last_send_seq)
 
-    def _read_body(self, bs) -> None:
+    # Consecutive undecodable packets before we give up on NACK-driven recovery
+    # and rebuild the session. The server re-sends NACKed reliable content in
+    # (nearly) every subsequent packet, so content we can NEVER decode fails
+    # every packet and holds the streak; transient bad states (e.g. a rare
+    # branch of an object's update that trips a decoder gap) clear within a few
+    # packets and reset it. ~30 packets/s -> roughly 5s of solid failure.
+    BODY_FAIL_STREAK_LIMIT = 150
+
+    def _read_body(self, bs) -> bool:
+        """Decode one packet body. Returns False when it could not be fully
+        decoded -- netconn then NACKs the packet (clears its ack bit) and the
+        server re-sends the reliable content, giving us a clean retry instead
+        of a silently-diverging session. All staged state from the failed
+        packet was rolled back (ghost table) or is exactly-once-guarded
+        (ordered events), so a later successful decode of the re-sent content
+        leaves us fully in sync.
+        """
+        ok = True
+        cause = None
         try:
             self.phases.read_packet_body(bs)
         except AlignmentError as exc:
-            if exc.fatal:
-                # The guaranteed-ordered event stream lost data the server
-                # believes was delivered (the packet is ACKed regardless).
-                # From here the string table / ghost table / phase state
-                # silently diverge and every later "decoded" event is suspect
-                # garbage -- the connection looks alive but chat/roster events
-                # stop flowing. Drop it so auto-reconnect builds a fresh
-                # session instead of zombie-ing.
-                self._on_fatal_desync(exc)
-            else:
-                # Ghost-section loss: the event section was already consumed,
-                # so only this packet's ghost updates are dropped. Log and
-                # carry on.
-                logger.warning("packet body alignment limit: %s", exc)
+            ok = False
+            cause = str(exc)
+        else:
+            if bs.error:
+                # We ran off the end of the stream without tripping a decoder
+                # guard: the packet mis-parsed somewhere in-bounds. NACK it too.
+                ok = False
+                cause = "bitstream overrun (misaligned body)"
         finally:
             # After each received packet, check whether the ghost-always burst has
             # finished; if so, reply ReadyForNormalGhosts to unblock the server's
@@ -382,9 +402,53 @@ class AotClient:
             # GhostAlwaysDone to a headless client). This is what lets the full
             # load complete -> Phase3 -> MissionStart -> the login response.
             self.phases.maybe_send_ready_for_normal_ghosts()
+        if ok:
+            if self._body_fail_streak:
+                logger.info(
+                    "packet body decode recovered after %d NACKed packet(s)",
+                    self._body_fail_streak,
+                )
+            self._body_fail_streak = 0
+            return True
+        self._note_body_failure(cause, bs)
+        return False
 
-    def _on_fatal_desync(self, exc: AlignmentError) -> None:
-        """Tear the connection down after an unrecoverable event-stream desync.
+    def _note_body_failure(self, cause: str, bs=None) -> None:
+        """Log (rate-limited) and count a NACKed packet; escalate to a full
+        reconnect only after BODY_FAIL_STREAK_LIMIT consecutive failures --
+        i.e. only when the re-sent content itself never decodes."""
+        self._body_fail_streak += 1
+        n = self._body_fail_counts[cause] = self._body_fail_counts.get(cause, 0) + 1
+        # Every failure logs at WARNING (deliberately NOT rate-limited: these
+        # are the primary signal for which decoder still needs fixing). The
+        # per-cause count makes repeat offenders obvious. Now that a failed
+        # packet is NACKed and its ghost-table staging rolled back, one bad
+        # object can no longer poison every subsequent packet, so the volume
+        # here reflects real, distinct decode problems.
+        logger.warning(
+            "undecodable packet body (x%d, streak %d): %s -- NACKed for "
+            "server re-send", n, self._body_fail_streak, cause,
+        )
+        # Raw packet + failing bit offset so the exact bytes can be replayed
+        # through tools/trace_capture_pkt.py / replay_s2c_audit.py offline --
+        # the highest-value artifact for fixing whatever decoder gap this is.
+        if bs is not None:
+            try:
+                logger.warning(
+                    "  failing packet (bitpos %d): %s",
+                    bs.get_bit_position(), bytes(bs.get_buffer()).hex(),
+                )
+            except Exception:
+                pass
+        if self._body_fail_streak >= self.BODY_FAIL_STREAK_LIMIT:
+            self._on_fatal_desync(
+                f"{self._body_fail_streak} consecutive undecodable packets; "
+                f"causes: {self._body_fail_counts}"
+            )
+
+    def _on_fatal_desync(self, cause: str) -> None:
+        """Tear the connection down once NACK-driven recovery has provably
+        stalled (the server's re-sent content never decodes).
 
         Called from inside the receive path (sync context), so the actual
         disconnect runs as a task; main.py's run loop then sees is_connected go
@@ -398,7 +462,7 @@ class AotClient:
         logger.error(
             "unrecoverable event-stream desync (%s); "
             "dropping connection to force a clean reconnect",
-            exc,
+            cause,
         )
         if self.conn is not None:
             asyncio.create_task(self.conn.disconnect("event stream desync"))
@@ -634,6 +698,17 @@ class AotClient:
         template = args[1] if len(args) > 1 else ""
         extra = args[2:]
         tag = msg_type.split(" ", 1)[0] if msg_type else ""
+
+        # MsgConnectionError is NOT an error: the server pre-arms EVERY client
+        # (the real one included -- see test-crate-item-drop.log in the game
+        # dir) with $Pref::Server::ConnectionError right after connect, to be
+        # displayed only if a connection error happens later. The real client's
+        # handler just stores the string (serverConnection.cs:
+        # handleConnectionErrorMessage). Mirror that: keep it, emit nothing.
+        if tag == "MsgConnectionError":
+            self._server_connection_error_text = template
+            logger.debug("stored server connection-error text: %r", template)
+            return
 
         # On a drop the registry removes the entry, so capture its accumulated
         # username history BEFORE updating the roster (so the player_dropped

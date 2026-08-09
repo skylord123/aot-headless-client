@@ -995,6 +995,124 @@ def _unpack_fx_dts_brick_data(bs: BitStream) -> None:
     bs.read_int(6)
 
 
+def _unpack_vehicle_data(bs: BitStream) -> None:
+    """VehicleData::unpackData (@ VA 0x4ccc60) -- the shared parent for
+    Flying/Hover/WheeledVehicleData (each subclass's unpackData starts with
+    ``call 0x4ccc60``). CFG-followed 0x4ccc60..0x4cd321 end-to-end; matches TGE
+    vehicle.cc in structure (AoT keeps every scalar a raw 4-byte read; the two
+    mathRead triples land in the 2x[3xread(4)] loop below). Layout:
+
+      ShapeBaseData::unpackData (0x47cad0);
+      read(4) x2                 body.restitution/friction (+0x308/+0x30c);
+      2 x db-ref                 body.sound[2] (loop @0x4cccc0, +0x300);
+      read(4) x19                impact/roll/steering/drag/jet/camera scalars
+                                 (+0x334..+0x344, +0x364,+0x360,+0x368..+0x394
+                                 @0x4ccd47..0x4ccef7);
+      flag                       bare bool -> byte +0x350 (@0x4ccf04);
+      read(4) x10                (+0x354,+0x358,+0x35c,+0x3a0,+0x3a4,+0x3e0,
+                                 +0x324,+0x328,+0x32c,+0x330 @0x4ccf4d..0x4cd025);
+      5 x db-ref                 waterSound[5] (loop @0x4cd044, +0x310);
+      db-ref                     dustEmitter (+0x39c @0x4cd0da..0x4cd130);
+      3 x db-ref                 splashEmitterList[3] (loop @0x4cd148, +0x3cc);
+      2 x db-ref                 (loop @0x4cd1d0, +0x3ec);
+      2 x [3 x read(4)]          two F32 triples (loop @0x4cd250, +0x3b4..+0x3c8);
+      read(4) x2                 (loop @0x4cd2a0, +0x3d8/+0x3dc);
+      read(4) x4                 (+0x3f4,+0x3f8,+0x348,+0x34c @0x4cd2c5..0x4cd30d).
+    """
+    _unpack_shape_base_data(bs)        # parent (0x47cad0)
+    _read_f32(bs)                      # body.restitution +0x308 (0x4ccc7e)
+    _read_f32(bs)                      # body.friction +0x30c (0x4ccc96)
+    for _ in range(2):                 # body.sound[2] (0x4cccc0 loop)
+        _read_db_ref(bs)
+    for _ in range(19):                # 19 scalars (0x4ccd47..0x4ccef7)
+        _read_f32(bs)
+    bs.read_flag()                     # bare bool +0x350 (0x4ccf04)
+    for _ in range(10):                # 10 scalars (0x4ccf4d..0x4cd025)
+        _read_f32(bs)
+    for _ in range(5):                 # waterSound[5] (0x4cd044 loop)
+        _read_db_ref(bs)
+    _read_db_ref(bs)                   # dustEmitter +0x39c (0x4cd0da)
+    for _ in range(3):                 # splash emitters (0x4cd148 loop, +0x3cc)
+        _read_db_ref(bs)
+    for _ in range(2):                 # (0x4cd1d0 loop, +0x3ec)
+        _read_db_ref(bs)
+    for _ in range(2):                 # 2 x F32 triple (0x4cd250 loop)
+        _read_f32(bs)
+        _read_f32(bs)
+        _read_f32(bs)
+    for _ in range(2):                 # (0x4cd2a0 loop, +0x3d8/+0x3dc)
+        _read_f32(bs)
+    for _ in range(4):                 # tail (+0x3f4,+0x3f8,+0x348,+0x34c)
+        _read_f32(bs)
+
+
+def _unpack_flying_vehicle_data(bs: BitStream) -> None:
+    """FlyingVehicleData::unpackData (@ VA 0x4c7510).
+
+    VehicleData::unpackData (0x4ccc60), then (CFG-followed 0x4c7527..0x4c77a1;
+    identical structure to TGE flyingVehicle.cc):
+      2 x db-ref    sound[2] (loop @0x4c7540, +0x3fc);
+      4 x db-ref    jetEmitter[4] (loop @0x4c75c2, +0x404);
+      read(4) x15   maneuveringForce..vertThrustMultiple (+0x418..+0x44c, incl
+                    the out-of-order stores +0x440/+0x43c and +0x414
+                    @0x4c763d..0x4c778d)."""
+    _unpack_vehicle_data(bs)           # parent (0x4ccc60)
+    for _ in range(2):                 # sound[2] (0x4c7540 loop)
+        _read_db_ref(bs)
+    for _ in range(4):                 # jetEmitter[4] (0x4c75c2 loop)
+        _read_db_ref(bs)
+    for _ in range(15):                # 15 scalars (0x4c763d..0x4c778d)
+        _read_f32(bs)
+
+
+def _unpack_hover_vehicle_data(bs: BitStream) -> None:
+    """HoverVehicleData::unpackData (@ VA 0x4c9f90).
+
+    VehicleData::unpackData (0x4ccc60), then (CFG-followed 0x4c9fa9..0x4ca34a;
+    identical structure to TGE hoverVehicle.cc):
+      read(4) x17   dragForce..pitchForce (+0x42c..+0x46c @0x4c9fad..0x4ca12d);
+      Point3F(12B)  dustTrailOffset (+0x484, 0x421240 @0x4ca142);
+      read(4) x2    triggerTrailHeight/dustTrailFreqMod (+0x490/+0x494);
+      3 x db-ref    sound[3] (loop @0x4ca190, +0x3fc);
+      3 x db-ref    jetEmitter[3] (loop @0x4ca1d0, +0x408);
+      db-ref        dustTrailID (+0x480 @0x4ca2a0..0x4ca2f6);
+      read(4) x3    floatingGravMag/brakingForce/brakingActivationSpeed
+                    (+0x470/+0x474/+0x478 @0x4ca307..0x4ca337)."""
+    _unpack_vehicle_data(bs)           # parent (0x4ccc60)
+    for _ in range(17):                # 17 scalars (0x4c9fad..0x4ca12d)
+        _read_f32(bs)
+    bs.read_bytes(12)                  # dustTrailOffset Point3F (0x4ca142)
+    _read_f32(bs)                      # triggerTrailHeight +0x490 (0x4ca155)
+    _read_f32(bs)                      # dustTrailFreqMod +0x494 (0x4ca16d)
+    for _ in range(3):                 # sound[3] (0x4ca190 loop)
+        _read_db_ref(bs)
+    for _ in range(3):                 # jetEmitter[3] (0x4ca1d0 loop)
+        _read_db_ref(bs)
+    _read_db_ref(bs)                   # dustTrailID +0x480 (0x4ca2a0)
+    for _ in range(3):                 # tail scalars (+0x470/+0x474/+0x478)
+        _read_f32(bs)
+
+
+def _unpack_wheeled_vehicle_data(bs: BitStream) -> None:
+    """WheeledVehicleData::unpackData (@ VA 0x4d1450).
+
+    VehicleData::unpackData (0x4ccc60), then (CFG-followed 0x4d1462..0x4d1520;
+    identical structure to TGE wheeledVehicle.cc):
+      db-ref        tireEmitter (+0x40c @0x4d1462..0x4d156c);
+      4 x db-ref    sound[4] (loop @0x4d1490, +0x3fc);
+      read(4) x4    maxWheelSpeed/engineTorque/engineBrake/brakeTorque
+                    (+0x410..+0x41c @0x4d14c5..0x4d150d).
+    NOTE: wheelCount is NOT here -- it is computed in preload from the .dts
+    ("hub%d" nodes), which is why WheeledVehicle::unpackUpdate's wheel loops
+    cannot be sized from the wire (see ghosts.WHEELED_VEHICLE_WHEEL_COUNT)."""
+    _unpack_vehicle_data(bs)           # parent (0x4ccc60)
+    _read_db_ref(bs)                   # tireEmitter +0x40c (0x4d1462)
+    for _ in range(4):                 # sound[4] (0x4d1490 loop)
+        _read_db_ref(bs)
+    for _ in range(4):                 # 4 scalars (0x4d14c5..0x4d150d)
+        _read_f32(bs)
+
+
 def _unpack_audio_description(bs: BitStream) -> None:
     """AudioDescription::unpackData (@ VA 0x58e1e0).
 
@@ -1088,23 +1206,18 @@ DECODERS: Dict[str, Callable[[BitStream], None]] = {
     # buffer installed (as during a real packet read) the decoder is exact:
     # registering it advances the capture stream past index 72 to ProjectileData.
     "ShapeBaseImageData": _unpack_shape_base_image_data,
-    # ------------------------------------------------------------------ #
-    # DELIBERATELY UNPORTED (documented; raise cleanly with the class name)
-    # ------------------------------------------------------------------ #
     # The three vehicle datablocks chain through VehicleData::unpackData
-    # (@ VA 0x4ccc60) -> ShapeBaseData, a large CFG with several inline-flag
-    # gated db-ref loops (body.sound[MaxSounds], waterSound[MaxSounds], damage/
-    # splash emitter id lists) plus per-subclass tails. The AoT fork's exact
-    # loop counts/widths could not be pinned by static CFG with the certainty
-    # required (one wrong bit silently desyncs the whole datablock stream), and
-    # NO vehicle datablock appears in ANY captured AoT world (the live world has
-    # no vehicles), so per the never-guess rule they are left raising:
-    #   FlyingVehicleData  (id 8,  unpackData @ 0x4c7510)  parent VehicleData
-    #   HoverVehicleData   (id 10, unpackData @ 0x4c9f90)  parent VehicleData
-    #   WheeledVehicleData (id 29, unpackData @ 0x4d1450)  parent VehicleData
-    # To port: CFG-follow VehicleData::unpackData @ 0x4ccc60 first (it is the
-    # shared parent), then each subclass tail; validate against a capture of a
-    # world that actually scopes a vehicle.
+    # (@ VA 0x4ccc60) -> ShapeBaseData. CFG-followed end-to-end (the previously
+    # ambiguous loop counts pinned from the exe: body.sound[2], waterSound[5],
+    # splash-emitter[3]+[2] db-ref loops, sound[2/3/4] + jetEmitter[4/3] per
+    # subclass) and cross-checked against TGE vehicle.cc/flyingVehicle.cc/
+    # hoverVehicle.cc/wheeledVehicle.cc (structure-identical). NOTE: no vehicle
+    # datablock appears in ANY captured/shipped AoT world, so these are
+    # exe-derived + synthetic-roundtrip validated only (no capture exercises
+    # them).
+    "FlyingVehicleData": _unpack_flying_vehicle_data,   # id 8,  0x4c7510
+    "HoverVehicleData": _unpack_hover_vehicle_data,     # id 10, 0x4c9f90
+    "WheeledVehicleData": _unpack_wheeled_vehicle_data, # id 29, 0x4d1450
 }
 
 

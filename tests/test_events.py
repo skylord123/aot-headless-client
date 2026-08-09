@@ -488,14 +488,17 @@ def test_sim_datablock_event_empty_present_flag():
 
 def test_sim_datablock_event_present_raises_with_classid():
     """A present SimDataBlockEvent decodes the envelope then raises
-    EventDecodeError (per-class unpackData not ported)."""
+    EventDecodeError when the datablock class has no decoder. Every REAL class
+    (0..33) now decodes, so use an out-of-table classId (the 6-bit id space
+    allows 0..63; >=34 is impossible from an unchanged server and proves
+    misalignment)."""
     from aotbot.events import EventDecodeError
     import pytest
     em = EventManager()
     bs = BitStream()
     bs.write_flag(True)               # present
     bs.write_int(5, 10)               # id - 3
-    bs.write_int(8, pc.NET_CLASS_BITS_DATABLOCK)   # datablock classId (FlyingVehicleData, no decoder)
+    bs.write_int(63, pc.NET_CLASS_BITS_DATABLOCK)  # out-of-table classId
     bs.write_int(0, 10)               # index
     bs.write_int(1, 11)               # total
     rs = BitStream(bs.get_bytes())
@@ -538,3 +541,74 @@ def test_ghost_always_object_event_flag_clear_no_classid():
     em._read_ghost_always_object_event(rs)
     assert rs.get_bit_position() == pc.GHOST_ID_BIT_SIZE + 1
     assert rs.read_int(2) == 0b11
+
+
+# --------------------------------------------------------------------------- #
+# Re-delivery (NACK) duplicate filter for guaranteed-ordered events
+# --------------------------------------------------------------------------- #
+
+
+def _packet_bytes(sender: EventManager, send_seq: int) -> bytes:
+    bs = BitStream()
+    sender.write_events(bs, current_send_seq=send_seq)
+    return bs.get_bytes()
+
+
+def test_redelivered_ordered_event_parses_but_does_not_redispatch():
+    """After we NACK a packet whose events we already processed, the server
+    re-sends them with the SAME ordered seq (netEvent.cc:81-95). The receiver
+    must parse the payload bit-exactly but dispatch it only once."""
+    sender = EventManager()
+    receiver = EventManager()
+    got = []
+    receiver.set_default_handler(lambda verb, args, evt: got.append((verb, args)))
+
+    sender.command_to_server("Talk", "hello")
+    pkt1 = _packet_bytes(sender, send_seq=1)
+    receiver.read_events(BitStream(pkt1))
+    assert got == [("Talk", ["hello"])]
+
+    # We NACKed pkt1: the sender is told it was lost and re-sends the same
+    # events (same seqs) in its next packet.
+    sender.notify_event_delivered(1, False)
+    pkt2 = _packet_bytes(sender, send_seq=2)
+    bs = BitStream(pkt2)
+    receiver.read_events(bs)
+    assert not bs.error                      # payload parsed cleanly
+    assert got == [("Talk", ["hello"])]      # ...but not dispatched again
+
+    # Delivery confirmed; a genuinely new event still dispatches.
+    sender.notify_event_delivered(2, True)
+    sender.command_to_server("Talk", "again")
+    pkt3 = _packet_bytes(sender, send_seq=3)
+    receiver.read_events(BitStream(pkt3))
+    assert got == [("Talk", ["hello"]), ("Talk", ["again"])]
+
+
+def test_redelivery_after_partial_processing_dispatches_only_the_missing_tail():
+    """pkt with events A,B: receiver processed A, then the packet failed later
+    (ghost section) and was NACKed. The re-send carries A,B again: A must be
+    discarded as a duplicate, B dispatched normally."""
+    sender = EventManager()
+    receiver = EventManager()
+    got = []
+    receiver.set_default_handler(lambda verb, args, evt: got.append(args[0]))
+
+    sender.command_to_server("Talk", "A")
+    sender.command_to_server("Talk", "B")
+    pkt1 = _packet_bytes(sender, send_seq=1)
+    receiver.read_events(BitStream(pkt1))
+    assert got == ["A", "B"]
+
+    # Simulate that only A was consumed before the body failed: rewind the
+    # receiver's next-expected seq to B's position minus... in practice the
+    # failure raises OUT of read_events so B's seq was never consumed. Model
+    # that state directly: expected seq points at B (the NetStringEvent + A
+    # were consumed; B was not).
+    receiver._next_recv_event_seq = (receiver._next_recv_event_seq - 1) & 0x7F
+    got.clear()
+
+    sender.notify_event_delivered(1, False)  # our NACK
+    pkt2 = _packet_bytes(sender, send_seq=2)
+    receiver.read_events(BitStream(pkt2))
+    assert got == ["B"]                      # A dup-filtered, B dispatched

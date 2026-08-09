@@ -629,6 +629,21 @@ class GameConnectionPhases:
         have seen so the new-vs-existing branch matches the engine. If we hit a
         class whose ``unpackUpdate`` is not ported we raise AlignmentError
         carrying the class so the caller logs exactly what blocks.
+
+        TRANSACTIONAL: all ``_ghost_classes`` / registry mutations are STAGED
+        and committed only if the whole section decodes. On failure the caller
+        NACKs the packet (netconn clears its ack bit), the server re-marks the
+        dropped ghost states dirty and re-sends them -- including the one-shot
+        new-ghost classId, because an un-acked create keeps GhostInfo in the
+        NotYetGhosted state (netGhost.cc:192-196) and the server sends NO
+        updates for such a ghost until the re-sent create is acked
+        (netGhost.cc:369-370). Committing eagerly here was the old poison-cascade
+        bug: a new ghost recorded from a packet whose tail we dropped (or a
+        garbage classId read after a misaligned unpackUpdate) permanently
+        diverged our new-vs-existing view from the server's, which is decided
+        purely by local-table presence (netGhost.cc:481) -- one bad packet then
+        misparsed EVERY later update for that ghost id (the 127k
+        "no unpackUpdate decoder for object class <52>" flood).
         """
         if bs.error:
             return
@@ -649,24 +664,33 @@ class GameConnectionPhases:
             return  # no ghost updates this packet
         id_size = bs.read_int(pc.GHOST_INDEX_BIT_SIZE) + 3  # readInt(4)+3 (0x5498e0)
 
+        _removed = object()  # staged-removal sentinel (class id 0 is valid)
+        staged: dict[int, object] = {}     # ghost_id -> class_id | _removed
+        registry_ops: list = []            # deferred registry mutations
+
+        def _staged_class(gid: int):
+            v = staged.get(gid, self._ghost_classes.get(gid))
+            return None if v is _removed else v
+
         for _ in range(1 << 14):  # bounded; real loop ends on the presence flag
             if bs.error:
                 return
             if not bs.read_flag():  # this-ghost present? (0x549900 inline readFlag)
-                return  # end of the ghost loop
+                break  # end of the ghost loop
             ghost_id = bs.read_int(id_size)  # readInt(idSize) (0x549932)
             if bs.read_flag():  # remove flag (0x5499f5 inline readFlag)
                 # Ghost removal: no payload (engine frees the ghost).
-                self._ghost_classes.pop(ghost_id, None)
+                staged[ghost_id] = _removed
                 if self.registry is not None:
-                    self.registry.remove(ghost_id)
+                    registry_ops.append(
+                        lambda _gid=ghost_id: self.registry.remove(_gid)
+                    )
                 continue
-            is_new = ghost_id not in self._ghost_classes
+            class_id = _staged_class(ghost_id)
+            is_new = class_id is None
             if is_new:
                 class_id = bs.read_int(pc.NET_CLASS_BITS_OBJECT)  # readClassId (0x54996c)
-                self._ghost_classes[ghost_id] = class_id
-            else:
-                class_id = self._ghost_classes[ghost_id]
+                staged[ghost_id] = class_id
             sink = telemetry.DecodeSink() if self.track_objects else None
             if sink is not None:
                 telemetry.set_sink(sink)
@@ -685,10 +709,25 @@ class GameConnectionPhases:
                     if 0 <= class_id < len(_gh.OBJECT_CLASS_NAMES)
                     else f"<{class_id}>"
                 )
-                self.registry.update_from_sink(
-                    ghost_id, name, sink, is_new=is_new,
-                    is_control=(ghost_id == self._control_ghost_id),
+                registry_ops.append(
+                    lambda _gid=ghost_id, _name=name, _sink=sink, _new=is_new: (
+                        self.registry.update_from_sink(
+                            _gid, _name, _sink, is_new=_new,
+                            is_control=(_gid == self._control_ghost_id),
+                        )
+                    )
                 )
+
+        # Whole section parsed cleanly -> commit.
+        if bs.error:
+            return  # ran off the stream end; caller NACKs, commit nothing
+        for gid, v in staged.items():
+            if v is _removed:
+                self._ghost_classes.pop(gid, None)
+            else:
+                self._ghost_classes[gid] = v
+        for op in registry_ops:
+            op()
 
     # ------------------------------------------------------------------ #
     # Packet body -- WRITE (client -> server)

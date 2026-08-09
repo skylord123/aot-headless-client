@@ -37,12 +37,19 @@ def test_class_name_table_indices():
 
 def test_unknown_class_raises_with_name():
     bs = BitStream(b"\x00" * 8)
-    # FlyingVehicleData (8) has no decoder yet (needs VehicleData parent chain;
-    # never appears in any AoT capture) -> raises carrying the name.
+    # A classId beyond the 34-entry table has no decoder -> raises carrying the
+    # (synthesised) name and id. Every REAL datablock class now has a decoder.
     with pytest.raises(DataBlockDecodeError) as ei:
-        unpack_datablock(bs, 8)
-    assert ei.value.name == "FlyingVehicleData"
-    assert ei.value.class_id == 8
+        unpack_datablock(bs, 63)
+    assert ei.value.name == "<63>"
+    assert ei.value.class_id == 63
+
+
+def test_all_datablock_classes_have_decoders():
+    # Final wave: all 34 datablock classes decode (the three vehicle datablocks
+    # were the last gaps -- VehicleData chain @ 0x4ccc60).
+    missing = [n for n in db.DATABLOCK_CLASS_NAMES if n not in db.DECODERS]
+    assert missing == []
 
 
 def test_implemented_set_registered():
@@ -273,6 +280,109 @@ def test_fx_dts_brick_data_stream():
 def test_path_camera_data_is_shape_base_data():
     # PathCameraData::unpackData tail-jumps to ShapeBaseData (== CameraData).
     assert db.DECODERS["PathCameraData"] is db._unpack_camera_data
+
+
+def _write_shape_base_data_minimal(bs):
+    """Minimal ShapeBaseData::unpackData payload (all flags clear, empty
+    strings) matching _unpack_shape_base_data's read sequence."""
+    bs.write_flag(False)               # computeCRC
+    bs.write_string("")                # shapeName
+    bs.write_string("")                # cloakTexName
+    for _ in range(9):
+        bs.write_flag(False)           # mass..cameraMaxFov absent
+    bs.write_string("")                # debrisShapeName
+    bs.write_flag(False)               # observeThroughObject
+    bs.write_flag(False)               # debrisID absent
+    bs.write_flag(False); bs.write_flag(False); bs.write_flag(False)
+    bs.write_flag(False)               # explosionID absent
+    bs.write_flag(False)               # underwaterExplosionID absent
+    bs.write_flag(False); bs.write_flag(False); bs.write_flag(False)
+
+
+def _write_vehicle_data_minimal(bs):
+    """Minimal VehicleData::unpackData (0x4ccc60) payload: ShapeBaseData
+    minimal + all 13 db-refs absent + 35 x read(4) + 1 bare flag."""
+    _write_shape_base_data_minimal(bs)
+    bs.write_bytes(b"\x00" * 8)        # body.restitution/friction
+    bs.write_flag(False); bs.write_flag(False)   # body.sound[2] absent
+    bs.write_bytes(b"\x00" * (19 * 4))           # 19 scalars
+    bs.write_flag(False)                         # bare bool +0x350
+    bs.write_bytes(b"\x00" * (10 * 4))           # 10 scalars
+    for _ in range(5):
+        bs.write_flag(False)                     # waterSound[5] absent
+    bs.write_flag(False)                         # dustEmitter absent
+    for _ in range(3):
+        bs.write_flag(False)                     # splash emitters absent
+    for _ in range(2):
+        bs.write_flag(False)                     # +0x3ec refs absent
+    bs.write_bytes(b"\x00" * (6 * 4))            # 2 x F32 triple
+    bs.write_bytes(b"\x00" * (2 * 4))            # +0x3d8/+0x3dc
+    bs.write_bytes(b"\x00" * (4 * 4))            # tail 4 scalars
+
+
+def _stream_roundtrip(write_fn, decode_fn):
+    bs = BitStream()
+    bs.set_string_buffer(bytearray(256))
+    write_fn(bs)
+    end = bs.get_bit_position()
+    rs = BitStream(bs.get_bytes())
+    rs.set_string_buffer(bytearray(256))
+    decode_fn(rs)
+    assert not rs.error
+    assert rs.get_bit_position() == end
+    return end
+
+
+def test_flying_vehicle_data_stream():
+    # VehicleData minimal + sound[2] absent + jetEmitter[4] absent + 15 read(4).
+    def w(bs):
+        _write_vehicle_data_minimal(bs)
+        for _ in range(2 + 4):
+            bs.write_flag(False)
+        bs.write_bytes(b"\x00" * (15 * 4))
+    _stream_roundtrip(w, db._unpack_flying_vehicle_data)
+
+
+def test_hover_vehicle_data_stream():
+    # VehicleData minimal + 17 read(4) + Point3F + 2 read(4) + sound[3] absent
+    # + jetEmitter[3] absent + dustTrailID present + 3 read(4).
+    def w(bs):
+        _write_vehicle_data_minimal(bs)
+        bs.write_bytes(b"\x00" * (17 * 4))
+        bs.write_bytes(b"\x00" * 12)   # dustTrailOffset Point3F
+        bs.write_bytes(b"\x00" * 8)    # triggerTrailHeight/dustTrailFreqMod
+        for _ in range(3 + 3):
+            bs.write_flag(False)
+        bs.write_flag(True)            # dustTrailID present
+        bs.write_int(7, 10)            # dustTrailID
+        bs.write_bytes(b"\x00" * (3 * 4))
+    _stream_roundtrip(w, db._unpack_hover_vehicle_data)
+
+
+def test_wheeled_vehicle_data_stream():
+    # VehicleData minimal + tireEmitter present + sound[4] absent + 4 read(4).
+    def w(bs):
+        _write_vehicle_data_minimal(bs)
+        bs.write_flag(True)            # tireEmitter present
+        bs.write_int(11, 10)           # tireEmitter id
+        for _ in range(4):
+            bs.write_flag(False)       # sound[4] absent
+        bs.write_bytes(b"\x00" * (4 * 4))
+    _stream_roundtrip(w, db._unpack_wheeled_vehicle_data)
+
+
+def test_vehicle_data_minimal_bit_count():
+    # The VehicleData body after ShapeBaseData: 2x32 + 2 + 19x32 + 1 + 10x32 +
+    # 5 + 1 + 3 + 2 + 6x32 + 2x32 + 4x32 = 43x32 + 14 flags = 1390 bits.
+    bs = BitStream()
+    bs.set_string_buffer(bytearray(256))
+    _write_shape_base_data_minimal(bs)
+    parent_bits = bs.get_bit_position()
+    _write_vehicle_data_minimal(BitStream())  # (structure documented above)
+    bs2 = BitStream()
+    bs2.set_string_buffer(bytearray(256))
+    _write_vehicle_data_minimal(bs2)
+    assert bs2.get_bit_position() - parent_bits == 43 * 32 + 14
 
 
 CAPTURE3 = os.path.join(

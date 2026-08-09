@@ -66,12 +66,27 @@ def test_parse_strips_ml_control_chars():
 
 def _feed_command(client: AotClient, verb: str, *args):
     """Encode commandToServer(verb, *args) from a peer and feed it into the
-    client's EventManager, exercising the full unpack + dispatch path."""
-    peer = EventManager()
+    client's EventManager, exercising the full unpack + dispatch path.
+
+    The peer EventManager persists per client (stashed on the client object) so
+    consecutive feeds produce a CONTINUOUS ordered-event seq stream, like a
+    real server. A fresh peer per call would restart its seq at 0 and trip the
+    client's re-delivery filter (which parses but does not re-dispatch an
+    already-seen ordered seq -- see EventManager.read_events).
+    """
+    peer = getattr(client, "_test_peer_events", None)
+    if peer is None:
+        peer = EventManager()
+        client._test_peer_events = peer
     peer.command_to_server(verb, *args)
     bs = BitStream()
-    peer.write_events(bs, current_send_seq=1)
+    send_seq = getattr(client, "_test_peer_send_seq", 0) + 1
+    client._test_peer_send_seq = send_seq
+    peer.write_events(bs, current_send_seq=send_seq)
+    # Confirm delivery so the peer's queue drains and the next feed re-packs
+    # only the new events.
     client.events.read_events(BitStream(bs.get_bytes()))
+    peer.notify_event_delivered(send_seq, True)
 
 
 def test_chat_message_dispatch_emits_on_chat():
@@ -485,7 +500,24 @@ def _desynced_body() -> BitStream:
 
 
 @pytest.mark.asyncio
-async def test_fatal_event_desync_forces_single_disconnect():
+async def test_event_desync_nacks_without_disconnect():
+    """An undecodable event section is NACKed (returns False) so netconn clears
+    the ack bit and the server re-sends; it does NOT drop the connection."""
+    client = AotClient(_cfg())
+
+    class FakeConn:
+        async def disconnect(self, reason="Done"):
+            raise AssertionError("a NACKable body must not drop the connection")
+
+    client.conn = FakeConn()
+    assert client._read_body(_desynced_body()) is False
+    assert client._read_body(_desynced_body()) is False
+    assert client._desync_abort_started is False
+    assert client._body_fail_streak == 2
+
+
+@pytest.mark.asyncio
+async def test_sustained_decode_failure_escalates_to_single_disconnect():
     client = AotClient(_cfg())
     calls = []
 
@@ -494,24 +526,31 @@ async def test_fatal_event_desync_forces_single_disconnect():
             calls.append(reason)
 
     client.conn = FakeConn()
-    # Two desynced packets in a row: teardown starts once, no duplicate tasks.
-    client._read_body(_desynced_body())
-    client._read_body(_desynced_body())
+    for _ in range(client.BODY_FAIL_STREAK_LIMIT + 2):
+        client._read_body(_desynced_body())
     assert client._desync_abort_started is True
     await asyncio.sleep(0)  # let the spawned disconnect task run
     assert calls == ["event stream desync"]
 
 
 @pytest.mark.asyncio
-async def test_ghost_desync_does_not_disconnect():
-    client = AotClient(_cfg(aot_track_objects=True))
-    client.phases.ghosting_active = True
+async def test_decode_success_resets_failure_streak():
+    client = AotClient(_cfg())
+    client.conn = None
+    for _ in range(5):
+        assert client._read_body(_desynced_body()) is False
+    assert client._body_fail_streak == 5
+    ok = BitStream()
+    ok.write_int(0, 32)          # moveAck
+    for _ in range(4):
+        ok.write_flag(False)     # damage/control/camera/fov flags
+    for _ in range(2):
+        ok.write_flag(False)     # empty event section
+    assert client._read_body(BitStream(ok.get_bytes())) is True
+    assert client._body_fail_streak == 0
 
-    class FakeConn:
-        async def disconnect(self, reason="Done"):
-            raise AssertionError("ghost-section loss must not drop the connection")
 
-    client.conn = FakeConn()
+def _ghost_body_with_unported_class() -> BitStream:
     bs = BitStream()
     bs.write_int(0, 32)          # moveAck
     for _ in range(4):
@@ -524,8 +563,25 @@ async def test_ghost_desync_does_not_disconnect():
     bs.write_int(5, 3)           # ghost id
     bs.write_flag(False)         # not a remove
     bs.write_int(5, 6)           # unported object class
-    client._read_body(BitStream(bs.get_bytes()))
+    return BitStream(bs.get_bytes())
+
+
+@pytest.mark.asyncio
+async def test_ghost_desync_nacks_and_stages_no_ghost_class():
+    client = AotClient(_cfg(aot_track_objects=True))
+    client.phases.ghosting_active = True
+
+    class FakeConn:
+        async def disconnect(self, reason="Done"):
+            raise AssertionError("ghost-section loss must not drop the connection")
+
+    client.conn = FakeConn()
+    assert client._read_body(_ghost_body_with_unported_class()) is False
     assert client._desync_abort_started is False
+    # The failed packet's new-ghost record must NOT be committed: the server
+    # will re-send the create (classId included) after our NACK, and committing
+    # eagerly would misparse that re-send as an existing-ghost update.
+    assert 5 not in client.phases._ghost_classes
     await asyncio.sleep(0)
 
 

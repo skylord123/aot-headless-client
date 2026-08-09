@@ -557,7 +557,20 @@ class NetConnection:
         self.last_seq_recvd = pk_seq
 
         if process_body:
-            self._handle_packet_body(bs)
+            if not self._handle_packet_body(bs):
+                # NACK: pretend this packet was lost. We already advanced
+                # last_seq_recvd and set the ack-mask low bit for this DATA
+                # packet (dnet.cc:183-187); clearing that bit back to 0 is the
+                # wire-legal "dropped" signal -- the server's handleNotify sees
+                # a hole in the mask and calls packetDropped, re-queuing the
+                # guaranteed events (same seq) and re-dirtying ghost states
+                # (including un-acked new-ghost classIds). Duplicate deliveries
+                # of events we DID process before the failure point are
+                # filtered by EventManager's ordered-seq duplicate filter.
+                self.ack_mask &= ~1
+                logger.debug(
+                    "NACKing undecodable packet seq=%d (ack bit cleared)", pk_seq
+                )
             # Do NOT reflexively answer every received packet with its own
             # DataPacket. The real client does not: it sends exactly one
             # move-bearing DataPacket per ~32 ms game tick and lets that scheduled
@@ -583,9 +596,16 @@ class NetConnection:
             if (has_data or self._send_requested) and not self.window_full():
                 self.send_data_packet()
 
-    def _handle_packet_body(self, bs: BitStream) -> None:
+    def _handle_packet_body(self, bs: BitStream) -> bool:
         """Top of handlePacket (netConnection.cc:497-529): the rate block, then
         the subclass body via the installed hook.
+
+        Returns True when the body decoded fully. A hook returning False (or
+        raising) means the body could not be decoded past some point; the
+        caller then treats the whole packet as LOST (clears its ack bit) so the
+        server's notify machinery re-sends the reliable content -- guaranteed
+        events keep their seq (netEvent.cc:81-95) and un-acked new-ghost
+        classIds are re-sent (netGhost.cc:192-196 restores NotYetGhosted).
         """
         if bs.read_flag():  # rateChangedFlag
             bs.read_int(10)  # updateDelay
@@ -594,9 +614,12 @@ class NetConnection:
             bs.read_int(10)
             bs.read_int(10)
         try:
-            self.read_packet_body(bs)
+            ok = self.read_packet_body(bs)
         except Exception:
             logger.exception("read_packet_body hook raised")
+            return False
+        # Hooks that predate the NACK scheme return None; treat that as success.
+        return ok is not False
 
     # ------------------------------------------------------------------ #
     # Keep-alive

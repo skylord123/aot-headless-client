@@ -212,8 +212,15 @@ class EventManager:
         self._out_queue: list[_PendingEvent] = []
         self._next_send_seq = 0  # 7-bit ordered seq for our outgoing events
 
-        # Incoming ordered-event bookkeeping (we process payloads inline to stay
-        # aligned; ordering is informational for the bot).
+        # Incoming ordered-event bookkeeping. The 7-bit wire seq of the next
+        # guaranteed-ordered event we have NOT yet dispatched. Because we may
+        # NACK a packet whose events we already processed (see
+        # netconn/_process_raw_packet: an undecodable body clears the ack bit so
+        # the server re-sends its reliable content), re-delivered events with an
+        # already-dispatched seq MUST be parsed for bit alignment but NOT
+        # re-dispatched. Stock Torque has no such filter (netEvent.cc:312-314
+        # would alias an old seq +128 and fire it late) -- it relies on "never
+        # re-send an acked event", which our deliberate NACKs violate.
         self._next_recv_event_seq = 0
 
         # Verb-name -> handler(args: list[str], raw: RemoteCommandEvent).
@@ -531,6 +538,8 @@ class EventManager:
             if not unguaranteed_phase and not bit:
                 return  # end of event section
             # bit == 1 -> an event follows.
+            dispatch = True
+            is_ordered = not unguaranteed_phase
             if not unguaranteed_phase:
                 # Ordered seq: a "prev+1" shortcut flag, then a 7-bit seq ONLY
                 # if the flag is 0. EXE-confirmed: eventReadPacket @ VA 0x548d25
@@ -546,18 +555,45 @@ class EventManager:
                 if bs.error:
                     return
                 prev_seq = seq
+                # Duplicate filter. The server sends ordered events strictly in
+                # seq order and (per eventPacketDropped, netEvent.cc:81-95)
+                # re-queues dropped ones sorted by their ORIGINAL seq, so the
+                # seqs we receive are always a contiguous run that can only
+                # start at-or-before _next_recv_event_seq. Anything != expected
+                # is therefore a re-delivery of an already-dispatched event
+                # (caused by one of our NACKs): parse it to stay aligned,
+                # dispatch nothing.
+                dispatch = seq == (self._next_recv_event_seq & EVENT_SEQ_MASK)
+                if not dispatch:
+                    logger.debug(
+                        "re-delivered ordered event seq=%d (expecting %d); "
+                        "parsing without dispatch",
+                        seq, self._next_recv_event_seq & EVENT_SEQ_MASK,
+                    )
             classid = bs.read_int(pc.NET_CLASS_BITS_EVENT)
-            self._read_one_event(bs, classid)
+            self._read_one_event(bs, classid, dispatch=dispatch)
             if bs.error:
                 return
+            # Only count the seq as consumed once the payload parsed fully --
+            # a decode failure raises out of this loop, the packet gets NACKed,
+            # and the server re-sends this event for a clean retry.
+            if is_ordered and dispatch:
+                self._next_recv_event_seq = (self._next_recv_event_seq + 1) & EVENT_SEQ_MASK
 
-    def _read_one_event(self, bs: BitStream, classid: int) -> None:
+    def _read_one_event(self, bs: BitStream, classid: int, dispatch: bool = True) -> None:
+        """Parse one event payload. ``dispatch=False`` (a re-delivered ordered
+        event we already processed) still parses every bit identically but
+        suppresses the side effects that must run exactly once (clientCmd
+        handlers, connection-message hooks -- the ones that emit user events or
+        send replies). Idempotent state application (string-table mappings,
+        ghost scoping, registry updates) runs either way.
+        """
         if classid == pc.NET_STRING_EVENT_CLASS_ID:
             self._read_net_string_event(bs)
         elif classid == pc.REMOTE_COMMAND_EVENT_CLASS_ID:
-            self._read_remote_command_event(bs)
+            self._read_remote_command_event(bs, dispatch=dispatch)
         elif classid == pc.EVENT_CLASS_IDS["ConnectionMessageEvent"]:
-            self._read_connection_message_event(bs)
+            self._read_connection_message_event(bs, dispatch=dispatch)
         elif classid == pc.EVENT_CLASS_IDS["PathManagerEvent"]:
             self._read_path_manager_event(bs)
         elif classid == pc.EVENT_CLASS_IDS["FileChunkEvent"]:
@@ -585,7 +621,7 @@ class EventManager:
             # prefix). Surface this loudly so phases.py / the caller can decide.
             raise EventDecodeError(classid)
 
-    def _read_connection_message_event(self, bs: BitStream) -> None:
+    def _read_connection_message_event(self, bs: BitStream, dispatch: bool = True) -> None:
         """ConnectionMessageEvent::unpack (AoT @ VA 0x5464a0):
         read(U32 sequence) + readInt(3) message + readInt(GhostIdBitSize+1=15)
         ghostCount.
@@ -604,14 +640,24 @@ class EventManager:
             "ConnectionMessageEvent seq=%d message=%d ghostCount=%d",
             sequence, message, ghost_count,
         )
-        if self.on_connection_message is not None:
+        if self.on_connection_message is not None and dispatch:
             try:
                 self.on_connection_message(message, sequence, ghost_count)
             except Exception:
                 logger.exception("on_connection_message hook raised")
 
     def _read_path_manager_event(self, bs: BitStream) -> None:
-        """PathManagerEvent::unpack (pathManager.cc:86): walk a path definition.
+        """PathManagerEvent::unpack (AoT @ VA 0x54d2c0), EXE-CONFIRMED bit-exact
+        to stock TGE (pathManager.cc:86): walk a path definition.
+
+        Disassembly: ``read(4)`` modifiedPath (``call [eax+4]`` push 4 @
+        0x54d2d8), inline readFlag clearPaths (bit test @ 0x54d30a), ``read(4)``
+        totalTime (@ 0x54d326), ``read(4)`` numPoints (@ 0x54d33b), setSize on
+        four vectors (elem sizes 12/16/4/4), then per point: 3x ``read(4)``
+        Point3F (@ 0x54d3f4/0x54d408/0x54d41d), QuatF via the 16-byte
+        mathRead helper (``call 0x4656d0`` @ 0x54d430), ``read(4)`` msToNext
+        (@ 0x54d44f), ``read(4)`` smoothingType (@ 0x54d46f). Loop bound is
+        positions.size() == numPoints (cmp @ 0x54d48a).
 
         We only decode it to stay bit-aligned (the server pushes path/mission
         data during load). Layout: read(U32 modifiedPath), readFlag clearPaths,
@@ -633,18 +679,31 @@ class EventManager:
         logger.debug("PathManagerEvent: %d points", num_points)
 
     def _read_file_chunk_event(self, bs: BitStream) -> None:
-        """FileChunkEvent::unpack (netDownload.cc): readRangedU32(0,63) chunkLen
-        then chunkLen raw bytes. The server streams a file to us (a resource the
-        client would normally write to disk). We decode it to stay aligned and
-        discard the bytes -- a headless bot needs no on-disk resources.
+        """FileChunkEvent::unpack (AoT @ VA 0x5481b0), EXE-CONFIRMED bit-exact
+        to stock TGE (netDownload.cc): readRangedU32(0,63) chunkLen then
+        chunkLen raw bytes.
+
+        Disassembly: ``push 0x40`` -> getNextPow2 -> getBinLog2 = 6 ->
+        ``readInt(6)`` (@ 0x5481cb), i.e. readRangedU32(0,63); then raw
+        ``read(len, buf)`` via bitstream vtable slot 4 (``call [edx+4]`` @
+        0x5481dc). The server streams a file to us (a resource the client would
+        normally write to disk). We decode it to stay aligned and discard the
+        bytes -- a headless bot needs no on-disk resources.
         """
         chunk_len = bs.read_ranged_u32(0, 63)
         bs.read_bytes(chunk_len)
         logger.debug("FileChunkEvent: %d bytes (discarded)", chunk_len)
 
     def _read_file_download_request_event(self, bs: BitStream) -> None:
-        """FileDownloadRequestEvent::unpack (netDownload.cc): readRangedU32(0,31)
-        nameCount then that many writeString file names.
+        """FileDownloadRequestEvent::unpack (AoT @ VA 0x5480a0), EXE-CONFIRMED
+        bit-exact to stock TGE (netDownload.cc): readRangedU32(0,31) nameCount
+        then that many readString file names.
+
+        Disassembly: ``push 0x20`` -> getNextPow2 -> getBinLog2 = 5 ->
+        ``readInt(5)`` (@ 0x5480bc), i.e. readRangedU32(0,31); then a loop of
+        nameCount readString calls via bitstream vtable slot 0x1c
+        (``call [eax+0x1c]`` @ 0x5480d5) into 0x100-byte name slots -- the
+        per-packet stringBuffer dedup path applies as usual.
         """
         name_count = bs.read_ranged_u32(0, 31)
         names = [bs.read_string() for _ in range(name_count)]
@@ -894,7 +953,7 @@ class EventManager:
         self.recv_table.map_string(index, text)
         logger.debug("NetStringEvent: recv slot %d -> %r", index, text)
 
-    def _read_remote_command_event(self, bs: BitStream) -> None:
+    def _read_remote_command_event(self, bs: BitStream, dispatch: bool = True) -> None:
         argc = bs.read_int(COMMAND_ARGS_BITS)
         argv: list[str] = []
         for _ in range(argc):
@@ -907,11 +966,22 @@ class EventManager:
         verb = verb.split(" ")[0] if " " in verb else verb
         resolved_args = [self.detag(a) for a in argv[1:]]
         evt = RemoteCommandEvent(argv=[verb] + resolved_args)
+        if not dispatch:
+            logger.debug(
+                "re-delivered clientCmd%s discarded (already dispatched)", verb
+            )
+            return
         # Log EVERY received clientCmd (verb + de-tagged args) at INFO so the full
         # server->client command stream is visible on the console without the
         # DEBUG transport hexdump noise. Ghost/move data is NOT a clientCmd and
         # stays quiet. Set LOG_LEVEL=warning to silence.
-        logger.info("clientCmd%s(%s)", verb, ", ".join(map(repr, resolved_args)))
+        # Exception: MsgConnectionError is the server pre-arming its disconnect
+        # text on every connect (sent to the real client too; purely cosmetic),
+        # so it stays at DEBUG -- at INFO it reads like a real failure.
+        if verb == "ServerMessage" and resolved_args[:1] == ["MsgConnectionError"]:
+            logger.debug("clientCmd%s(%s)", verb, ", ".join(map(repr, resolved_args)))
+        else:
+            logger.info("clientCmd%s(%s)", verb, ", ".join(map(repr, resolved_args)))
         self._dispatch_remote_command(verb, resolved_args, evt)
 
     def _dispatch_remote_command(
