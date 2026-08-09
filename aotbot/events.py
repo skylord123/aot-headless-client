@@ -555,20 +555,41 @@ class EventManager:
                 if bs.error:
                     return
                 prev_seq = seq
-                # Duplicate filter. The server sends ordered events strictly in
-                # seq order and (per eventPacketDropped, netEvent.cc:81-95)
-                # re-queues dropped ones sorted by their ORIGINAL seq, so the
-                # seqs we receive are always a contiguous run that can only
-                # start at-or-before _next_recv_event_seq. Anything != expected
-                # is therefore a re-delivery of an already-dispatched event
-                # (caused by one of our NACKs): parse it to stay aligned,
-                # dispatch nothing.
-                dispatch = seq == (self._next_recv_event_seq & EVENT_SEQ_MASK)
+                # Ordered-delivery filter. Three cases, split on the 7-bit
+                # distance from the expected next seq (the server can be at
+                # most 126 ahead -- netEvent.cc:203 send window -- and our NACK
+                # re-deliveries at most a window behind, so a 64/64 split is
+                # unambiguous in practice):
+                #
+                # rel == 0   -> the expected event: dispatch it.
+                # rel >= 64  -> BEHIND: a re-delivery of an event we already
+                #               dispatched (caused by one of our NACKs; the
+                #               server re-sends with the ORIGINAL seq,
+                #               netEvent.cc:81-95). Parse to stay bit-aligned,
+                #               dispatch nothing.
+                # 0<rel<64   -> AHEAD: a GAP -- an earlier event-bearing packet
+                #               was lost in transit and the server sent newer
+                #               events on top. Stock Torque queues these until
+                #               the hole fills (netEvent.cc:322-341); we instead
+                #               NACK this packet (raise -> AlignmentError ->
+                #               ack bit cleared) so the server re-sends BOTH the
+                #               lost events (loss already visible to it as a
+                #               hole in our ack mask) and these, which then
+                #               arrive contiguously and dispatch in order.
+                #               ACKing a gap packet would be fatal: the server
+                #               would consider the gapped events delivered and
+                #               never re-send them, and the expected seq could
+                #               then never advance -- every later clientCmd
+                #               would be silently discarded as "behind".
+                expected = self._next_recv_event_seq & EVENT_SEQ_MASK
+                rel = (seq - expected) & EVENT_SEQ_MASK
+                dispatch = rel == 0
+                if 0 < rel < 64:
+                    raise EventSequenceGapError(expected, seq)
                 if not dispatch:
                     logger.debug(
                         "re-delivered ordered event seq=%d (expecting %d); "
-                        "parsing without dispatch",
-                        seq, self._next_recv_event_seq & EVENT_SEQ_MASK,
+                        "parsing without dispatch", seq, expected,
                     )
             classid = bs.read_int(pc.NET_CLASS_BITS_EVENT)
             self._read_one_event(bs, classid, dispatch=dispatch)
@@ -1001,6 +1022,22 @@ class EventManager:
                 logger.exception("default event handler raised")
         else:
             logger.debug("unhandled clientCmd%s(%s)", verb, args)
+
+
+class EventSequenceGapError(Exception):
+    """An ordered event arrived AHEAD of the expected seq: an earlier
+    event-bearing packet was lost in transit. The caller must NACK this packet
+    (not ACK it!) so the server re-sends the gapped events -- see the
+    ordered-delivery filter in :meth:`EventManager.read_events`.
+    """
+
+    def __init__(self, expected: int, got: int) -> None:
+        super().__init__(
+            f"ordered-event gap: expected seq {expected}, got {got} "
+            f"(an earlier packet was lost in transit)"
+        )
+        self.expected = expected
+        self.got = got
 
 
 class EventDecodeError(Exception):

@@ -612,3 +612,79 @@ def test_redelivery_after_partial_processing_dispatches_only_the_missing_tail():
     pkt2 = _packet_bytes(sender, send_seq=2)
     receiver.read_events(BitStream(pkt2))
     assert got == ["B"]                      # A dup-filtered, B dispatched
+
+
+def test_seq_gap_raises_so_packet_is_nacked_then_heals_in_order():
+    """PRODUCTION REGRESSION (silent clientCmd death): packet with event seq0
+    lost in transit; a later packet carries seq1. ACKing that packet would make
+    the server consider seq1 delivered forever while we never dispatched it,
+    and the expected seq would never advance again. The reader must raise
+    EventSequenceGapError (-> caller NACKs), and after the server re-sends,
+    both events must dispatch exactly once, in order."""
+    import pytest
+    from aotbot.events import EventSequenceGapError
+
+    sender = EventManager()
+    receiver = EventManager()
+    got = []
+    receiver.set_default_handler(lambda verb, args, evt: got.append(args[0]))
+
+    sender.command_to_server("Talk", "one")
+    bs1 = BitStream()
+    sender.write_events(bs1, current_send_seq=1)   # packet 1: LOST in transit
+
+    sender.command_to_server("Talk", "two")
+    bs2 = BitStream()
+    sender.write_events(bs2, current_send_seq=2)   # packet 2: arrives first
+
+    with pytest.raises(EventSequenceGapError):
+        receiver.read_events(BitStream(bs2.get_bytes()))
+    assert got == []  # nothing dispatched out of order
+
+    # The server learns pkt1 was lost (ack-mask hole) and pkt2 was NACKed by
+    # us; both events re-send together, sorted by seq (netEvent.cc:81-95).
+    sender.notify_event_delivered(1, False)
+    sender.notify_event_delivered(2, False)
+    bs3 = BitStream()
+    sender.write_events(bs3, current_send_seq=3)
+    receiver.read_events(BitStream(bs3.get_bytes()))
+    assert got == ["one", "two"]
+
+
+def test_seq_gap_heals_even_if_gap_packet_was_partially_processed():
+    """Gap detected at the SECOND ordered event of a packet: the first was
+    already dispatched. After the NACK + re-send, the first is dup-filtered
+    and the gapped one dispatches -- exactly once each, in order."""
+    import pytest
+    from aotbot.events import EventSequenceGapError
+
+    sender = EventManager()
+    receiver = EventManager()
+    got = []
+    receiver.set_default_handler(lambda verb, args, evt: got.append(args[0]))
+
+    # seq stream: NetStringEvent(Talk)=0, "one"=1, "two"=2, "three"=3.
+    sender.command_to_server("Talk", "one")
+    bs1 = BitStream()
+    sender.write_events(bs1, current_send_seq=1)
+    receiver.read_events(BitStream(bs1.get_bytes()))
+    sender.notify_event_delivered(1, True)
+    assert got == ["one"]
+
+    sender.command_to_server("Talk", "two")
+    bs2 = BitStream()
+    sender.write_events(bs2, current_send_seq=2)   # carries seq2: LOST
+
+    sender.command_to_server("Talk", "three")
+    bs3 = BitStream()
+    sender.write_events(bs3, current_send_seq=3)   # carries seq3: arrives
+
+    with pytest.raises(EventSequenceGapError):
+        receiver.read_events(BitStream(bs3.get_bytes()))
+
+    sender.notify_event_delivered(2, False)
+    sender.notify_event_delivered(3, False)
+    bs4 = BitStream()
+    sender.write_events(bs4, current_send_seq=4)   # re-sends seq2 + seq3
+    receiver.read_events(BitStream(bs4.get_bytes()))
+    assert got == ["one", "two", "three"]

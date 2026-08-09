@@ -664,3 +664,28 @@ def test_login_success_requests_whole_world_scope():
     sent = _capture_sent(client)
     _feed_command(client, "LoginSuccess")
     assert ("dropCameraAtPlayer", ()) in sent
+
+
+@pytest.mark.asyncio
+async def test_ordered_event_gap_nacks_packet_not_disconnect():
+    """A gapped ordered-event seq (earlier packet lost in transit) must NACK
+    the packet -- returning False from _read_body -- so the server re-sends the
+    lost events; it must NOT be ACKed (silent permanent clientCmd loss) and
+    must NOT drop the connection."""
+    client = AotClient(_cfg())
+
+    class FakeConn:
+        async def disconnect(self, reason="Done"):
+            raise AssertionError("a seq gap must not drop the connection")
+
+    client.conn = FakeConn()
+    bs = BitStream()
+    bs.write_int(0, 32)          # moveAck
+    for _ in range(4):
+        bs.write_flag(False)     # damage/control/camera/fov flags
+    bs.write_flag(False)         # end of unguaranteed phase
+    bs.write_flag(True)          # a guaranteed-ordered event present
+    bs.write_flag(False)         # no prev+1 shortcut -> explicit seq
+    bs.write_int(5, 7)           # seq 5 while 0 is expected -> gap
+    assert client._read_body(BitStream(bs.get_bytes())) is False
+    assert client._desync_abort_started is False

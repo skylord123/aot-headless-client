@@ -32,7 +32,7 @@ from typing import Callable, Optional
 
 from . import protocol_constants as pc
 from .bitstream import BitStream
-from .events import EventManager, EventDecodeError
+from .events import EventManager, EventDecodeError, EventSequenceGapError
 
 logger = logging.getLogger("aotbot.phases")
 
@@ -487,10 +487,11 @@ class GameConnectionPhases:
             self._read_control_header(bs)
             try:
                 self.events.read_events(bs)
-            except EventDecodeError as exc:
-                # Event-section loss is FATAL: the packet is still ACKed, so
-                # every guaranteed-ordered event in the dropped tail is lost
-                # forever and the session state diverges (see AlignmentError).
+            except (EventDecodeError, EventSequenceGapError) as exc:
+                # Undecodable event OR an ordered-seq gap (an earlier packet
+                # was lost in transit): either way this packet must be NACKed
+                # -- netconn clears its ack bit and the server re-sends the
+                # reliable content for a clean, in-order retry.
                 raise AlignmentError(str(exc), fatal=True) from exc
             # Install the point-compression REFERENCE for this packet's ghost
             # section: BitStream::readCompressedPoint (0x421a70) dequantises
