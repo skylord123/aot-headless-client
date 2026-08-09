@@ -1,0 +1,285 @@
+[
+  {
+    "id": "7be3f9bf69b948e7",
+    "type": "group",
+    "z": "7ed3b854ed04dbfa",
+    "name": "Convert incoming TCP data from bot into events",
+    "style": {
+      "label": true,
+      "color": "#000000"
+    },
+    "nodes": [
+      "8627bc343e0ab64e",
+      "c36d54d9d7af598e",
+      "9d46e36bba569f4e",
+      "99663b1c1b156bc6",
+      "d98a174fd51e1568",
+      "e159296b5345de97",
+      "0ead9733c28d197a"
+    ],
+    "x": 54,
+    "y": 39,
+    "w": 652,
+    "h": 202
+  },
+  {
+    "id": "8627bc343e0ab64e",
+    "type": "event-listener-emit",
+    "z": "7ed3b854ed04dbfa",
+    "g": "7be3f9bf69b948e7",
+    "name": "",
+    "eventListenerNamespace": "b679015d4a7eb42d",
+    "eventIdType": "msg",
+    "eventIdValue": "action",
+    "sendType": "msg",
+    "payloadType": "msg",
+    "payloadValue": "payload",
+    "x": 470,
+    "y": 140,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "c36d54d9d7af598e",
+    "type": "debug",
+    "z": "7ed3b854ed04dbfa",
+    "g": "7be3f9bf69b948e7",
+    "name": "Error parsing",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "true",
+    "targetType": "full",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 570,
+    "y": 200,
+    "wires": []
+  },
+  {
+    "id": "9d46e36bba569f4e",
+    "type": "change",
+    "z": "7ed3b854ed04dbfa",
+    "g": "7be3f9bf69b948e7",
+    "name": "",
+    "rules": [
+      {
+        "t": "set",
+        "p": "action",
+        "pt": "msg",
+        "to": "payload.action",
+        "tot": "msg",
+        "dc": true
+      }
+    ],
+    "action": "",
+    "property": "",
+    "from": "",
+    "to": "",
+    "reg": false,
+    "x": 240,
+    "y": 140,
+    "wires": [
+      [
+        "8627bc343e0ab64e"
+      ]
+    ]
+  },
+  {
+    "id": "99663b1c1b156bc6",
+    "type": "websocket in",
+    "z": "7ed3b854ed04dbfa",
+    "g": "7be3f9bf69b948e7",
+    "name": "",
+    "server": "",
+    "client": "82626bb18421a3f0",
+    "x": 210,
+    "y": 80,
+    "wires": [
+      [
+        "e159296b5345de97"
+      ]
+    ]
+  },
+  {
+    "id": "d98a174fd51e1568",
+    "type": "debug",
+    "z": "7ed3b854ed04dbfa",
+    "g": "7be3f9bf69b948e7",
+    "name": "AOT Incoming",
+    "active": true,
+    "tosidebar": true,
+    "console": false,
+    "tostatus": false,
+    "complete": "payload",
+    "targetType": "msg",
+    "statusVal": "",
+    "statusType": "auto",
+    "x": 580,
+    "y": 80,
+    "wires": []
+  },
+  {
+    "id": "e159296b5345de97",
+    "type": "json",
+    "z": "7ed3b854ed04dbfa",
+    "g": "7be3f9bf69b948e7",
+    "name": "",
+    "property": "payload",
+    "action": "",
+    "pretty": false,
+    "x": 410,
+    "y": 80,
+    "wires": [
+      [
+        "d98a174fd51e1568",
+        "9d46e36bba569f4e"
+      ]
+    ]
+  },
+  {
+    "id": "0ead9733c28d197a",
+    "type": "catch",
+    "z": "7ed3b854ed04dbfa",
+    "g": "7be3f9bf69b948e7",
+    "name": "",
+    "scope": "group",
+    "uncaught": false,
+    "x": 390,
+    "y": 200,
+    "wires": [
+      [
+        "c36d54d9d7af598e"
+      ]
+    ]
+  },
+  {
+    "id": "b679015d4a7eb42d",
+    "type": "event-listener-namespace",
+    "name": "aot_in"
+  },
+  {
+    "id": "82626bb18421a3f0",
+    "type": "websocket-client",
+    "path": "ws://aot-headless-client:1234",
+    "tls": "",
+    "wholemsg": "false",
+    "hb": "0",
+    "subprotocol": "",
+    "headers": []
+  },
+  {
+    "id": "ab8274dc0a65d1a3",
+    "type": "group",
+    "z": "7ed3b854ed04dbfa",
+    "name": "Log server restarts",
+    "style": {
+      "label": true,
+      "color": "#000000"
+    },
+    "nodes": [
+      "46a8bd44cf0c3b95",
+      "2e40cad401210acf",
+      "530ea8d42276ebb0",
+      "38ec49e9a698c663"
+    ],
+    "x": 54,
+    "y": 279,
+    "w": 512,
+    "h": 142
+  },
+  {
+    "id": "46a8bd44cf0c3b95",
+    "type": "event-listener-on",
+    "z": "7ed3b854ed04dbfa",
+    "g": "ab8274dc0a65d1a3",
+    "name": "",
+    "eventListenerNamespace": "b679015d4a7eb42d",
+    "eventId": "sync_clock",
+    "x": 200,
+    "y": 320,
+    "wires": [
+      [
+        "2e40cad401210acf"
+      ]
+    ]
+  },
+  {
+    "id": "2e40cad401210acf",
+    "type": "function",
+    "z": "7ed3b854ed04dbfa",
+    "g": "ab8274dc0a65d1a3",
+    "name": "Sync Clock",
+    "func": "// Incoming uptime from the server\nconst newUptime = msg.payload.uptime_seconds;\nif (typeof newUptime !== \"number\") {\n    node.error(\"sync_clock without numeric uptime_seconds\", msg);\n    return null;\n}\n\n// When we received this reading (ms since epoch). Prefer the bot's own\n// timestamp so Node-RED queueing delays don't skew the math.\nconst receivedAt = (typeof msg.payload.received_at === \"number\")\n    ? msg.payload.received_at * 1000\n    : Date.now();\n\n// Last reading we saw (undefined on first run / after a Node-RED restart)\nconst last = flow.get(\"lastSync\");\n\n// Always save the new reading for next time\nflow.set(\"lastSync\", { uptime: newUptime, at: receivedAt });\n\n// First reading — nothing to compare against, treat as normal\nif (!last || typeof last.uptime !== \"number\" || typeof last.at !== \"number\") {\n    node.status({ fill: \"grey\", shape: \"ring\", text: \"init: \" + newUptime + \"s\" });\n    return [null, msg];\n}\n\n// Real seconds that passed between the two readings\nconst elapsed = Math.max(0, (receivedAt - last.at) / 1000);\n\n// If the server never restarted, its uptime should now be roughly\n// lastUptime + elapsed. A restart anywhere in the gap caps reported\n// uptime at `elapsed`, so it falls short of expected by at least\n// lastUptime. The server under-reports uptime when bogged down, so\n// only call it a restart when we're below HALF of expected.\nconst expected = last.uptime + elapsed;\n\n// Uptime going backwards is always a restart: a bogged-down counter\n// runs slow, but it never runs backwards.\nconst restarted = newUptime < last.uptime || newUptime < expected * 0.5;\n\nif (restarted) {\n    msg.previous_uptime = last.uptime;\n    msg.expected_uptime = Math.round(expected);\n    msg.gap_seconds = Math.round(elapsed);\n    node.status({ fill: \"red\", shape: \"dot\", text: \"restart detected\" });\n    return [msg, null];\n}\n\nnode.status({ fill: \"green\", shape: \"dot\", text: \"up \" + newUptime + \"s (~\" + Math.round(expected) + \"s expected)\" });\nreturn [null, msg];",
+    "outputs": 2,
+    "timeout": 0,
+    "noerr": 0,
+    "initialize": "",
+    "finalize": "",
+    "libs": [],
+    "x": 410,
+    "y": 320,
+    "wires": [
+      [
+        "38ec49e9a698c663"
+      ],
+      []
+    ]
+  },
+  {
+    "id": "530ea8d42276ebb0",
+    "type": "file",
+    "z": "7ed3b854ed04dbfa",
+    "g": "ab8274dc0a65d1a3",
+    "name": "",
+    "filename": "/data/storage/aot-server-restarts.log",
+    "filenameType": "str",
+    "appendNewline": true,
+    "createDir": true,
+    "overwriteFile": "false",
+    "encoding": "none",
+    "x": 400,
+    "y": 380,
+    "wires": [
+      []
+    ]
+  },
+  {
+    "id": "38ec49e9a698c663",
+    "type": "change",
+    "z": "7ed3b854ed04dbfa",
+    "g": "ab8274dc0a65d1a3",
+    "name": "",
+    "rules": [
+      {
+        "t": "set",
+        "p": "payload",
+        "pt": "msg",
+        "to": "(     $ts := $exists(payload.received_at) ? $fromMillis($round(payload.received_at * 1000)) : $now();     $prev := $type(previous_uptime) = \"number\" ? $string(previous_uptime) & \"s\" : \"unknown\";     $ts & \" | server restart detected | uptime=\" & $string(payload.uptime_seconds) & \"s | previous=\" & $prev )",
+        "tot": "jsonata"
+      }
+    ],
+    "action": "",
+    "property": "",
+    "from": "",
+    "to": "",
+    "reg": false,
+    "x": 160,
+    "y": 380,
+    "wires": [
+      [
+        "530ea8d42276ebb0"
+      ]
+    ]
+  },
+  {
+    "id": "24130327dc955255",
+    "type": "global-config",
+    "env": [],
+    "modules": {
+      "@skylord123/event-listener": "0.0.3"
+    }
+  }
+]
