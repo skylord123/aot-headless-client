@@ -87,6 +87,7 @@ selects the handler; the remaining fields are action-specific. The `action` is
 | `players`      | —                                       | Request the online roster. Replies with a `players` message. |
 | `connection_state` | —                                   | Request the current connection status. Replies with a `connection_state` message (`state` + `logged_in`). |
 | `sync_clock`   | —                                       | Request the last server clock sync. Replies with a `sync_clock` message (nulls if none received yet). |
+| `control_object` | —                                     | Request what object the server has us controlling (Player vs Camera). Replies with `control_object`. |
 | `list_objects` | `all` (bool, optional)                  | Request the tracked object list. With `all: true`, includes removed objects. Replies with `object_list`. |
 | `get_object`   | `ghost_id` (int)                        | Request one object by integer ghost id. Replies with `object` (`null` if missing/invalid). |
 
@@ -250,6 +251,7 @@ Emitted in response to an inbound request:
 | `connection_state` | `connection_state` | `state` (str), `logged_in` (bool) | The current connection status (same shape as the pushed event). |
 | `sync_clock`  | `sync_clock`   | `uptime_seconds` (number\|null), `received_at` (unix seconds\|null) | The last server clock sync; nulls if none received yet. |
 | `object_list` | `list_objects` | `objects` (array)               | The tracked object/ghost list.                     |
+| `control_object` | `control_object` (also pushed on change) | `ghost_id` (int\|null), `class_name` (str\|null), `object` (object\|null) | What the server has us controlling. `class_name` is the netclass (`"Camera"` = whole-world ghost scope, `"Player"` = local scope bubble only; null until the ghost's class is known). `object` is the full tracked-object dict (needs `AOT_TRACK_OBJECTS`). Also pushed unprompted whenever control changes. With `AOT_AUTO_DROP_CAMERA_AT_PLAYER` (default on) the bot auto-sends `dropCameraAtPlayer` whenever it finds itself controlling its Player, so it stays in whole-world scope. |
 | `object`      | `get_object`   | `object` (object \| `null`)     | One object; `null` when the ghost id is unknown or unparseable. |
 
 > **Note:** query replies are broadcast to **all** connected clients, not just

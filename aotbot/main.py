@@ -198,6 +198,14 @@ async def _main(config: Config, interactive: bool = False) -> None:
     client.on_connection_state = on_connection_state
     client.on_sync_clock = on_sync_clock
 
+    def on_control_change(info: dict) -> None:
+        # Pushed whenever the server changes which object we control (Player vs
+        # Camera) or its class becomes known. Same shape as the control_object
+        # query reply.
+        forward({"action": "control_object", **info})
+
+    client.on_control_change = on_control_change
+
     # ---- inbound: action handlers (shared by both transports) ----------- #
     # The actual game-side behavior lives here, expressed against plain Python
     # values. Each transport adapts its own wire format onto these: Node-RED
@@ -261,6 +269,13 @@ async def _main(config: Config, interactive: bool = False) -> None:
         # pushed event.
         forward({"action": "sync_clock", **client.sync_clock_status()})
 
+    def act_control_object() -> None:
+        # -> {"action":"control_object","ghost_id":...,"class_name":...,
+        #     "object":{...}|null} -- what the server has us controlling
+        # (Camera = whole-world scope, Player = local bubble). Same shape as
+        # the pushed control_object event.
+        forward({"action": "control_object", **client.get_control_object()})
+
     def act_get_object(ghost_id) -> None:
         # -> {"action":"object","object":{...}|null}
         obj = None
@@ -291,6 +306,7 @@ async def _main(config: Config, interactive: bool = False) -> None:
         bridge.register_handler("players", lambda c: act_players())
         bridge.register_handler("connection_state", lambda c: act_connection())
         bridge.register_handler("sync_clock", lambda c: act_sync_clock())
+        bridge.register_handler("control_object", lambda c: act_control_object())
         bridge.register_handler("get_object", lambda c: act_get_object(c.args[0] if c.args else None))
         bridge.register_handler("disconnect", lambda c: act_disconnect())
 
@@ -319,6 +335,7 @@ async def _main(config: Config, interactive: bool = False) -> None:
         server.register_handler("players", lambda m: act_players())
         server.register_handler("connection_state", lambda m: act_connection())
         server.register_handler("sync_clock", lambda m: act_sync_clock())
+        server.register_handler("control_object", lambda m: act_control_object())
         server.register_handler("get_object", lambda m: act_get_object(m.get("ghost_id")))
         server.register_handler("disconnect", lambda m: act_disconnect())
 

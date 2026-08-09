@@ -132,6 +132,15 @@ class Config:
     # default), the ghost section is left untouched (minimal CPU) -- chat/login
     # still work since the ghost section is last in each packet.
     aot_track_objects: bool = False
+    # Whole-world scope enforcement: whenever the server puts us in control of
+    # our PLAYER object (login spawn, respawn after death, admin action), send
+    # commandToServer('dropCameraAtPlayer') so we control the detached CAMERA
+    # instead. Controlling the camera makes the server ghost EVERY object in
+    # the world; controlling the player only ghosts the local scope bubble
+    # (distant/interior objects -- e.g. a player inside a far-away shop --
+    # would be invisible to the bot). Default on (matches the long-standing
+    # login-time behavior); set false to stay in player control.
+    aot_auto_drop_camera_at_player: bool = True
 
     @classmethod
     def load(
@@ -201,6 +210,10 @@ class Config:
         track_objects = _str2bool(
             env.get("AOT_TRACK_OBJECTS", "false"), var="AOT_TRACK_OBJECTS"
         )
+        auto_drop_camera = _str2bool(
+            env.get("AOT_AUTO_DROP_CAMERA_AT_PLAYER", "true"),
+            var="AOT_AUTO_DROP_CAMERA_AT_PLAYER",
+        )
         create_user = _str2bool(
             env.get("AOT_CREATE_USER", "false"), var="AOT_CREATE_USER"
         )
@@ -250,6 +263,7 @@ class Config:
             dump_packets=dump_packets,
             aot_skip_lighting=skip_lighting,
             aot_track_objects=track_objects,
+            aot_auto_drop_camera_at_player=auto_drop_camera,
         )
         cfg._validate()
 

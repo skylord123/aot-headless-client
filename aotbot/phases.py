@@ -225,6 +225,13 @@ class GameConnectionPhases:
         # for the eager login that surfaces the login result.
         self.on_phase2_acked: Callable[[], None] = lambda: None
         self._eager_login_done = False
+        # Hook fired when the CONTROL object changes -- either a different ghost
+        # id, or the same id's netclass becoming known (the class arrives via
+        # the ghost stream, usually a packet or two after the control header
+        # first names the id). (ghost_id, class_id|None). client.py uses this
+        # for get_control_object() and the auto dropCameraAtPlayer behavior.
+        self.on_control_object: Optional[Callable[[int, Optional[int]], None]] = None
+        self._last_control_report: Optional[tuple] = None
 
         self._register_handlers()
 
@@ -559,6 +566,15 @@ class GameConnectionPhases:
                 control_ghost_id = bs.read_int(pc.GHOST_ID_BIT_SIZE)
                 self._control_ghost_id = control_ghost_id
                 class_id = self._ghost_classes.get(control_ghost_id)
+                # Report control-object changes (new id OR its class becoming
+                # known) to the client layer.
+                report = (control_ghost_id, class_id)
+                if report != self._last_control_report and self.on_control_object:
+                    self._last_control_report = report
+                    try:
+                        self.on_control_object(control_ghost_id, class_id)
+                    except Exception:
+                        logger.exception("on_control_object hook raised")
                 sink = telemetry.DecodeSink() if self.track_objects else None
                 if sink is not None:
                     telemetry.set_sink(sink)

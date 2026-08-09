@@ -689,3 +689,75 @@ async def test_ordered_event_gap_nacks_packet_not_disconnect():
     bs.write_int(5, 7)           # seq 5 while 0 is expected -> gap
     assert client._read_body(BitStream(bs.get_bytes())) is False
     assert client._desync_abort_started is False
+
+
+# --------------------------------------------------------------------------- #
+# Control-object tracking + AUTO_DROP_CAMERA_AT_PLAYER
+# --------------------------------------------------------------------------- #
+
+
+def test_get_control_object_unknown_initially():
+    client = AotClient(_cfg())
+    info = client.get_control_object()
+    assert info == {"ghost_id": None, "class_name": None, "object": None}
+
+
+def test_control_object_resolves_class_and_emits():
+    from aotbot import ghosts as gh
+
+    client = AotClient(_cfg(aot_track_objects=True))
+    changes = []
+    client.on_control_change = lambda info: changes.append(info)
+    player_cls = gh.OBJECT_CLASS_NAMES.index("Player")
+    client._on_control_object(1234, player_cls)
+    info = client.get_control_object()
+    assert info["ghost_id"] == 1234
+    assert info["class_name"] == "Player"
+    assert changes and changes[-1]["class_name"] == "Player"
+
+
+def test_auto_drop_camera_when_controlling_player():
+    from aotbot import ghosts as gh
+
+    client = AotClient(_cfg(aot_auto_drop_camera_at_player=True))
+    sent = []
+    client.events.command_to_server = lambda verb, *a: sent.append(verb)
+    client._logged_in = True
+    player_cls = gh.OBJECT_CLASS_NAMES.index("Player")
+    client._on_control_object(1234, player_cls)
+    assert sent == ["dropCameraAtPlayer"]
+    # Debounced: an immediate repeat report does not spam the server.
+    client._on_control_object(1234, player_cls)
+    assert sent == ["dropCameraAtPlayer"]
+
+
+def test_no_auto_drop_when_controlling_camera_or_disabled():
+    from aotbot import ghosts as gh
+
+    camera_cls = gh.OBJECT_CLASS_NAMES.index("Camera")
+    player_cls = gh.OBJECT_CLASS_NAMES.index("Player")
+
+    client = AotClient(_cfg(aot_auto_drop_camera_at_player=True))
+    sent = []
+    client.events.command_to_server = lambda verb, *a: sent.append(verb)
+    client._logged_in = True
+    client._on_control_object(7, camera_cls)   # camera control: nothing to do
+    assert sent == []
+
+    client2 = AotClient(_cfg(aot_auto_drop_camera_at_player=False))
+    sent2 = []
+    client2.events.command_to_server = lambda verb, *a: sent2.append(verb)
+    client2._logged_in = True
+    client2._on_control_object(7, player_cls)  # option off: no auto drop
+    assert sent2 == []
+
+
+def test_no_auto_drop_before_login():
+    from aotbot import ghosts as gh
+
+    client = AotClient(_cfg(aot_auto_drop_camera_at_player=True))
+    sent = []
+    client.events.command_to_server = lambda verb, *a: sent.append(verb)
+    player_cls = gh.OBJECT_CLASS_NAMES.index("Player")
+    client._on_control_object(7, player_cls)
+    assert sent == []

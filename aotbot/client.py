@@ -193,6 +193,11 @@ class AotClient:
         # server restart (a sudden drop below the previous value).
         #   on_sync_clock(uptime_seconds: float, received_at: float)
         self.on_sync_clock: Optional[Callable[[float, float], None]] = None
+        # Control-object change: emitted whenever the server changes which
+        # object we control, or its class becomes known. Receives the same dict
+        # get_control_object() returns.
+        #   on_control_change(info: dict)
+        self.on_control_change: Optional[Callable[[dict], None]] = None
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -256,8 +261,17 @@ class AotClient:
         # (base/skylord/bot/login.cs).
         self._login_deferred = False
 
+        # Control-object tracking (per connection): the ghost id the server says
+        # we control, its resolved netclass name (None until the ghost's class
+        # is known), and the auto-dropCameraAtPlayer debounce clock.
+        self._control_ghost: Optional[int] = None
+        self._control_class: Optional[str] = None
+        self._last_drop_camera_at = 0.0
+
         # Wire EventManager -> connection send request.
         self.events.request_send = self._request_send
+        # Control-object change hook (get_control_object + auto camera drop).
+        self.phases.on_control_object = self._on_control_object
 
         # Register the chat/server/login clientCmd handlers.
         self._register_event_handlers()
@@ -903,6 +917,67 @@ class AotClient:
     def _on_unhandled_cmd(self, verb: str, args: list[str], evt: RemoteCommandEvent) -> None:
         logger.debug("unhandled clientCmd%s(%s)", verb, args)
 
+    # ------------------------------------------------------------------ #
+    # Control object (what the server has us "driving": Player vs Camera)
+    # ------------------------------------------------------------------ #
+
+    def get_control_object(self) -> dict:
+        """What object the server currently has us controlling.
+
+        Returns ``{"ghost_id": int|None, "class_name": str|None, "object":
+        dict|None}``. ``class_name`` is the netclass ("Player", "Camera", ...)
+        -- None until the ghost's class has been learned from the ghost stream.
+        ``object`` is the full tracked-object dict (position/damage/etc.) when
+        ``AOT_TRACK_OBJECTS`` is on and the ghost is in the registry, else
+        None. All None while logged out (no control object scoped).
+
+        Camera vs Player matters for scope: controlling the detached CAMERA
+        makes the server ghost the whole world; controlling the PLAYER only
+        ghosts the local bubble (see AOT_AUTO_DROP_CAMERA_AT_PLAYER).
+        """
+        obj = None
+        if self.phases.registry is not None and self._control_ghost is not None:
+            rec = self.phases.registry.get(self._control_ghost)
+            if rec is not None:
+                obj = rec.to_dict()
+        return {
+            "ghost_id": self._control_ghost,
+            "class_name": self._control_class,
+            "object": obj,
+        }
+
+    def _on_control_object(self, ghost_id: int, class_id: Optional[int]) -> None:
+        """phases hook: the control object (or its class knowledge) changed."""
+        from . import ghosts as _gh
+
+        name = (
+            _gh.OBJECT_CLASS_NAMES[class_id]
+            if class_id is not None and 0 <= class_id < len(_gh.OBJECT_CLASS_NAMES)
+            else None
+        )
+        self._control_ghost = ghost_id
+        self._control_class = name
+        logger.info("control object -> ghost %d (%s)", ghost_id, name or "class unknown")
+        self._emit(self.on_control_change, self.get_control_object())
+        # Whole-world scope enforcement: if we ended up controlling our PLAYER
+        # (login spawn, respawn after death, ...), ask the server to detach the
+        # camera again so it keeps ghosting every object in the world. Debounced
+        # so a flapping/ignored request can't spam the server (the switch to
+        # Camera control arrives within a tick when it works).
+        if (
+            name == "Player"
+            and self.config.aot_auto_drop_camera_at_player
+            and self._logged_in
+        ):
+            now = time.monotonic()
+            if now - self._last_drop_camera_at >= 3.0:
+                self._last_drop_camera_at = now
+                logger.info(
+                    "controlling our Player -> dropCameraAtPlayer "
+                    "(re-acquiring whole-world scope)"
+                )
+                self.events.command_to_server("dropCameraAtPlayer")
+
     def _mark_logged_in(self, detail: str) -> None:
         if self._logged_in:
             return
@@ -913,9 +988,13 @@ class AotClient:
         # objects regardless of distance (mirrors cameraHack.cs
         # startCameraFly's commandToServer('dropCameraAtPlayer')), so the
         # roster/object telemetry sees the whole world, not just our scope
-        # bubble.
-        logger.info("requesting whole-world scope (dropCameraAtPlayer)")
-        self.events.command_to_server("dropCameraAtPlayer")
+        # bubble. Gated on AOT_AUTO_DROP_CAMERA_AT_PLAYER (default on); the
+        # same option also RE-drops the camera any time the server hands
+        # control back to our Player (e.g. respawn) -- see _on_control_object.
+        if self.config.aot_auto_drop_camera_at_player:
+            logger.info("requesting whole-world scope (dropCameraAtPlayer)")
+            self._last_drop_camera_at = time.monotonic()
+            self.events.command_to_server("dropCameraAtPlayer")
         self._emit(self.on_login_result, True, detail)
         # Login flag flipped -> emit an updated connection status.
         self._set_connection()
