@@ -123,3 +123,26 @@ def test_match_flags_control_object_as_self():
     out = match_player_objects(players, objects)
     assert out[0]["is_self"] is True
     assert out[0]["object_id"] == 3
+
+
+def test_match_player_objects_lifts_damage_level():
+    from aotbot.playerlist import PlayerInfo, match_player_objects
+
+    players = [PlayerInfo(client_id=1, name="alice")]
+    objects = [{
+        "ghost_id": 42, "class_name": "Player", "name": "alice",
+        "position": [1, 2, 3], "damage_level": 0.5, "dead": False,
+        "is_control_object": False,
+    }]
+    out = match_player_objects(players, objects)
+    assert out[0]["damage_level"] == 0.5
+    assert out[0]["dead"] is False
+
+
+def test_match_player_objects_damage_none_when_unscoped():
+    from aotbot.playerlist import PlayerInfo, match_player_objects
+
+    players = [PlayerInfo(client_id=1, name="bob")]
+    out = match_player_objects(players, [])
+    assert out[0]["damage_level"] is None
+    assert out[0]["dead"] is None

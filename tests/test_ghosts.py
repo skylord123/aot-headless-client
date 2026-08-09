@@ -893,3 +893,77 @@ def test_packet_data_decoders_cover_all_gamebase_classes():
             assert name not in gh.PACKET_DATA_DECODERS
         else:
             assert name in gh.PACKET_DATA_DECODERS, name
+
+
+# --------------------------------------------------------------------------- #
+# ShapeBase damage block (0x483e36) -> damage telemetry (WAVE-22)
+# --------------------------------------------------------------------------- #
+
+
+def _decode_with_sink(class_name, write_fn, *, is_new=True):
+    """Like _decode but with a telemetry DecodeSink installed; returns (bits,
+    sink.fields)."""
+    from aotbot import telemetry
+
+    bs = BitStream()
+    write_fn(bs)
+    rs = BitStream(bs.get_bytes())
+    sink = telemetry.DecodeSink()
+    telemetry.set_sink(sink)
+    try:
+        gh.DECODERS[class_name](rs, is_new)
+    finally:
+        telemetry.set_sink(None)
+    assert not rs.error
+    return rs.get_bit_position(), sink.fields
+
+
+def _write_damage_block(bs, *, frac_units: int, state: int):
+    """The ShapeBase 0x483e36 damage block: writeFloat(frac,6) + writeInt(2)
+    + normal-vector(8) (17 bits), prefixed by GameBase(2 clear) + master(1) +
+    damage flag(1), followed by the remaining ShapeBase masks all clear."""
+    bs.write_flag(False)          # GameBase pos
+    bs.write_flag(False)          # GameBase datablock
+    bs.write_flag(True)           # ShapeBase master
+    bs.write_flag(True)           # damage block present
+    bs.write_int(frac_units, 6)   # writeFloat(mDamage/maxDamage, 6) = u/63
+    bs.write_int(state, 2)        # damage state (2 = Destroyed)
+    # writeNormalVector(8) = signed-float(9) + signed-float(8) = 17 bits
+    # (mDamageDir -- consumed, not surfaced).
+    bs.write_int(0, 9)
+    bs.write_int(0, 8)
+    for _ in range(5):            # image-trigger/skin/mounted/core/mount masks
+        bs.write_flag(False)
+
+
+def test_shape_base_damage_block_emits_damage_level():
+    def w(bs):
+        _write_damage_block(bs, frac_units=32, state=0)  # ~half health, Enabled
+    bits, fields = _decode_with_sink("ShapeBase", w)
+    assert fields["damage_level"] == pytest.approx(32 / 63.0)
+    assert fields["damage_state"] == 0
+    # The 8-bit normal vector in this block is mDamageDir (last-hit direction),
+    # NOT orientation -- it must no longer surface as rotation telemetry.
+    assert "rotation" not in fields
+
+
+def test_shape_base_damage_destroyed_state():
+    def w(bs):
+        _write_damage_block(bs, frac_units=63, state=2)  # dead
+    _, fields = _decode_with_sink("ShapeBase", w)
+    assert fields["damage_level"] == pytest.approx(1.0)
+    assert fields["damage_state"] == 2
+
+
+def test_player_inherits_damage_telemetry():
+    # Player::unpackUpdate calls ShapeBase as its parent, so a Player update
+    # carrying the damage block surfaces the same fields. Player's own masks
+    # after the ShapeBase prefix are written all-clear.
+    def w(bs):
+        _write_damage_block(bs, frac_units=16, state=0)
+        # Player's own 7 top-level masks after the ShapeBase parent, all clear
+        # (0x46e6d8, 0x46e76d, 0x46e987, 0x46e9cb, 0x46ed05, 0x46ed61, 0x46eda5).
+        for _ in range(7):
+            bs.write_flag(False)
+    bits, fields = _decode_with_sink("Player", w)
+    assert fields["damage_level"] == pytest.approx(16 / 63.0)

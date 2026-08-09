@@ -183,9 +183,20 @@ class ObjectRecord:
     rotation: Optional[Any] = None
     scale: Optional[Tuple[float, float, float]] = None
     mount: Optional[int] = None
+    # TGE getDamagePercent semantics, straight off the wire (ShapeBase damage
+    # block @ 0x483e36: writeFloat(mDamage/maxDamage, 6) -> u/63): 0.0 =
+    # unhurt .. 1.0 = dead. None until the first damage update for this ghost
+    # (the server only sends the block when DamageMask is dirty -- but the
+    # initial update packs ALL masks, so any ghost scoped after tracking
+    # started has it). ``damage_state`` is the 2-bit enum (0=Enabled,
+    # 1=Disabled, 2=Destroyed); Destroyed forces damage_level to 1.0.
+    damage_level: Optional[float] = None
+    damage_state: Optional[int] = None
     is_control_object: bool = False
     scoped: bool = True
     last_update: float = field(default_factory=time.monotonic)
+
+    DAMAGE_STATE_DESTROYED = 2
 
     def to_dict(self) -> Dict[str, Any]:
         pos = (
@@ -204,6 +215,11 @@ class ObjectRecord:
         # shape_name = the human-facing label: the in-game NAME if known (player
         # username), else the datablock model file (.dts).
         shape_name = self.name or self.shape_file or self.shape_name
+        damage = self.damage_level
+        if self.damage_state == self.DAMAGE_STATE_DESTROYED:
+            damage = 1.0  # dead: the engine slams mDamage to max on Destroyed
+        if damage is not None:
+            damage = round(damage, 4)
         return {
             "ghost_id": self.ghost_id,
             "class_name": self.class_name,
@@ -215,6 +231,12 @@ class ObjectRecord:
             "rotation": rot,
             "scale": scale,
             "mount": self.mount,
+            "damage_level": damage,
+            "damage_state": self.damage_state,
+            "dead": (
+                None if self.damage_state is None
+                else self.damage_state == self.DAMAGE_STATE_DESTROYED
+            ),
             "is_control_object": self.is_control_object,
             "scoped": self.scoped,
             "age": round(time.monotonic() - self.last_update, 3),
@@ -322,6 +344,10 @@ class ObjectRegistry:
             rec.scale = f["scale"]
         if f.get("mount") is not None:
             rec.mount = f["mount"]
+        if f.get("damage_level") is not None:
+            rec.damage_level = f["damage_level"]
+        if f.get("damage_state") is not None:
+            rec.damage_state = f["damage_state"]
         if is_control:
             self.set_control_object(ghost_id)
         return rec

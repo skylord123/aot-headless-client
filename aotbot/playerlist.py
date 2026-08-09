@@ -219,6 +219,12 @@ def match_player_objects(
         d = p.to_dict()
         d["object_id"] = obj.get("ghost_id") if obj else None
         d["position"] = obj.get("position") if obj else None
+        # TGE getDamagePercent, straight from the ghost stream: 0.0 = unhurt ..
+        # 1.0 = dead (forced to 1.0 while the object is in the Destroyed
+        # damage state). None when no ghost is scoped or no damage update has
+        # been seen yet.
+        d["damage_level"] = obj.get("damage_level") if obj else None
+        d["dead"] = obj.get("dead") if obj else None
         d["is_self"] = bool(obj and obj.get("is_control_object"))
         d["object"] = obj  # full player object JSON, or None
         out.append(d)

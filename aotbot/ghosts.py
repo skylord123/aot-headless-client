@@ -365,12 +365,25 @@ def _unpack_shape_base(bs: BitStream, is_new: bool) -> None:
     if not bs.read_flag():
         return
 
-    # 0x483e36: orientation/move-state block.
+    # 0x483e36: DAMAGE block (WAVE-22 relabel -- was "orientation/move-state").
+    # RE-pinned against pack side (ShapeBase::packUpdate @ 0x480650, damage
+    # writes @ 0x4807da-0x480854: fld [this+0xa04 mDamage]; fdiv [db+0x78
+    # maxDamage]; clamp 0..1; writeFloat(6)):
+    #   * readFloat(6) @ 0x483e56 -> the NORMALIZED damage fraction (wire value
+    #     u/63, 0=healthy .. 1=dead), unpacked as u/63 * maxDamage -> mDamage
+    #     [+0xa04] (fmul @ 0x483e61, clamp, fstp @ 0x483e90). This IS TGE's
+    #     getDamagePercent -- report it directly, no datablock lookup needed
+    #     (ShapeBaseData::maxDamage [+0x78] is never on the wire).
+    #   * readInt(2) @ 0x483e9a -> mDamageState [+0xa14] (0=Enabled,
+    #     1=Disabled, 2=Destroyed; ==2 triggers blowUp @ vtbl+0x10c).
+    #   * readNormalVector(8) @ 0x483eb0 -> mDamageDir [+0xa20], the direction
+    #     of the LAST HIT -- NOT the object's orientation. (Previously
+    #     mis-emitted as "rotation", which polluted ShapeBase rotation
+    #     telemetry with hit directions on every damage update.)
     if bs.read_flag():
-        bs.read_float(6)            # readFloat(6) (0x483e56)
-        bs.read_int(2)              # readInt(2)   (0x483e9a)
-        # readNormalVector(8) = 17 bits (0x483eb0): the object's orientation.
-        _emit_rotation(_read_normal_vector(bs, 8))
+        telemetry.emit("damage_level", bs.read_float(6))   # u/63 (0x483e56)
+        telemetry.emit("damage_state", bs.read_int(2))     # (0x483e9a)
+        _read_normal_vector(bs, 8)                         # mDamageDir (0x483eb0)
 
     # 0x483f13: 4-slot image-trigger loop (0x483f30..0x4840a0).
     if bs.read_flag():
@@ -419,15 +432,20 @@ def _unpack_shape_base(bs: BitStream, is_new: bool) -> None:
 
     # 0x484572: ShapeBase core-state block.
     if bs.read_flag():
-        # 0x4845a2: damage/energy sub-block.
+        # 0x4845a2: CLOAK/FADE sub-block (WAVE-22 relabel -- was mislabeled
+        # "damage/energy"; disassembly-pinned member stores):
+        #   flag @0x4845d4 -> setCloakedState (0x47e340; mCloaked [+0xa2d])
+        #   flag @0x484612 -> mIsControlled [+0xa50]
+        #   flag @0x484646 -> mFading [+0xa3a]; if set: flag mFadeOut [+0xa39]
+        #     + raw F32 mFadeTime [+0xa44] (0x4846b2); else: flag -> mFadeVal.
         if bs.read_flag():
-            bs.read_flag()           # (0x4845d4)
-            bs.read_flag()           # (0x484612)
-            if bs.read_flag():       # (0x484646) -- if set:
-                bs.read_flag()       # (0x484680)
-                bs.read_bytes(4)     # read(4) (0x4846b2)
+            bs.read_flag()           # cloaked (0x4845d4)
+            bs.read_flag()           # isControlled (0x484612)
+            if bs.read_flag():       # fading (0x484646) -- if set:
+                bs.read_flag()       # fadeOut (0x484680)
+                bs.read_bytes(4)     # F32 fadeTime (0x4846b2)
             else:                    # if clear:
-                bs.read_flag()       # (0x4846f2)
+                bs.read_flag()       # fadeVal 0/1 (0x4846f2)
         # 0x484732: skin/name override (tagged string) -> mShapeNameTag [+0x948].
         # This is the Player's NAME (what getShapeName returns), resolved via the
         # connection's receive NetStringTable for a tag slot, or a literal.
@@ -1713,7 +1731,12 @@ def _unpack_player(bs: BitStream, is_new: bool) -> None:
         bs.read_int(3)                 # (0x46e996)
 
     if bs.read_flag():                 # (0x46e9cb)
-        bs.read_int(8)                 # damage state idx (0x46e9de)
+        # Action-ANIMATION sequence index (WAVE-22 relabel -- was "damage state
+        # idx"): bounds-checked against 0x44 with the "Player::setActionThread"
+        # error string @ 0x5fa600 and used to index the PlayerData action table
+        # [+0x420 + idx*0x1c]. Includes death anims but is NOT ShapeBase's
+        # damage state (that is the 2-bit field in the 0x483e36 damage block).
+        bs.read_int(8)                 # setActionThread seq idx (0x46e9de)
         # THREE unconditional flags are read in order, stored to [esp+0x4c],
         # [esp+0x50], bl (0x46ea15, 0x46ea4b, 0x46ea7e). Then a conditional
         # readSignedFloat(6) is gated on the SECOND flag ([esp+0x50]) being

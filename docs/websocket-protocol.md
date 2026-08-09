@@ -271,13 +271,32 @@ One JSON object per WebSocket text frame:
 {"action": "connection_state", "state": "ingame_loggedout", "logged_in": true}
 {"action": "connection_state", "state": "reconnecting", "logged_in": false}
 {"action": "sync_clock", "uptime_seconds": 86400.0, "received_at": 1751328000.123}
-{"action": "players", "players": [{"name": "alice", "client_id": 7, "object_id": 1234, "associated_usernames": ["alice"]}]}
+{"action": "players", "players": [{"name": "alice", "client_id": 7, "object_id": 1234, "damage_level": 0.5, "dead": false, "associated_usernames": ["alice"]}]}
 {"action": "object_list", "objects": [{"id": 1234, "class": "Player"}]}
 {"action": "object", "object": {"id": 1234, "class": "Player"}}
 ```
 
 (The `players` / `object_list` / `object` array element shapes are owned by the
 game client's object tracking; the fields shown are illustrative.)
+
+### Damage level
+
+Every ShapeBase-derived tracked object (Player, AIPlayer, vehicles, items,
+static shapes, ...) carries TGE `getDamagePercent`-style damage telemetry,
+decoded straight from the ghost stream (the server sends damage as a 6-bit
+normalized fraction):
+
+- `damage_level` (float 0..1 | null) — `0.0` unhurt, `0.5` half health,
+  `1.0` dead. Forced to `1.0` while the object is in the Destroyed damage
+  state. `null` until the first damage update for that ghost is seen (the
+  initial scope update always includes it).
+- `damage_state` (int | null, objects only) — the engine's 2-bit enum:
+  `0` Enabled, `1` Disabled, `2` Destroyed.
+- `dead` (bool | null) — convenience: `damage_state == 2`.
+
+`damage_level` and `dead` appear on each `object_list`/`object` entry AND are
+lifted to the top level of each `players` roster entry (null when the player's
+ghost is not currently scoped). Requires `AOT_TRACK_OBJECTS`.
 
 ## Logging
 

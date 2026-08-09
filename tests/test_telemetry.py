@@ -430,3 +430,61 @@ def test_real_login_fills_marker_and_light_positions():
             continue
         assert any(r["position"] is not None for r in recs), \
             f"{cn} still has no position after the Box6F fallback"
+
+
+# --------------------------------------------------------------------------- #
+# Damage-level telemetry (WAVE-22)
+# --------------------------------------------------------------------------- #
+
+
+def test_registry_stores_damage_level_and_state():
+    from aotbot.telemetry import DecodeSink, ObjectRegistry
+
+    reg = ObjectRegistry()
+    sink = DecodeSink()
+    sink.set("damage_level", 32 / 63.0)
+    sink.set("damage_state", 0)
+    rec = reg.update_from_sink(7, "Player", sink, is_new=True)
+    d = rec.to_dict()
+    assert d["damage_level"] == round(32 / 63.0, 4)
+    assert d["damage_state"] == 0
+    assert d["dead"] is False
+
+
+def test_registry_destroyed_forces_damage_one():
+    from aotbot.telemetry import DecodeSink, ObjectRegistry
+
+    reg = ObjectRegistry()
+    sink = DecodeSink()
+    sink.set("damage_level", 0.9)
+    sink.set("damage_state", 2)  # Destroyed
+    d = reg.update_from_sink(7, "Player", sink).to_dict()
+    assert d["damage_level"] == 1.0
+    assert d["dead"] is True
+
+
+def test_registry_damage_unknown_until_first_update():
+    from aotbot.telemetry import DecodeSink, ObjectRegistry
+
+    reg = ObjectRegistry()
+    d = reg.update_from_sink(7, "Player", DecodeSink()).to_dict()
+    assert d["damage_level"] is None
+    assert d["damage_state"] is None
+    assert d["dead"] is None
+
+
+def test_registry_damage_persists_across_updates_without_the_block():
+    # Damage arrives only when DamageMask is dirty; later position-only updates
+    # must not clear the last known value.
+    from aotbot.telemetry import DecodeSink, ObjectRegistry
+
+    reg = ObjectRegistry()
+    s1 = DecodeSink()
+    s1.set("damage_level", 0.25)
+    s1.set("damage_state", 0)
+    reg.update_from_sink(7, "Player", s1, is_new=True)
+    s2 = DecodeSink()
+    s2.set("position", (1.0, 2.0, 3.0))
+    d = reg.update_from_sink(7, "Player", s2).to_dict()
+    assert d["damage_level"] == 0.25
+    assert d["position"] == [1.0, 2.0, 3.0]
