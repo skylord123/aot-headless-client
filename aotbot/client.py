@@ -31,7 +31,7 @@ from typing import Callable, Optional
 
 from . import protocol_constants as pc
 from .config import Config
-from .crc import get_string_crc
+from .crc import get_string_crc_signed
 from .events import EventManager, RemoteCommandEvent
 from .masterserver import MasterServerError, fetch_server_host
 from .netconn import ConnState, NetConnection
@@ -584,8 +584,10 @@ class AotClient:
         password = password if password is not None else self.config.aot_password
         self._login_user = user
         self._login_password = password  # kept for the auto-create path
-        crc = get_string_crc(password)
-        logger.info("logging in as %r (pass crc=%d)", user, crc)
+        crc = get_string_crc_signed(password)
+        # Never log the CRC: the server authenticates against it directly, so
+        # it is password-equivalent.
+        logger.info("logging in as %r", user)
         self.events.command_to_server("login", user, crc)
 
     def logout(self) -> None:
@@ -661,7 +663,7 @@ class AotClient:
         # The post-create "<name> logged in." broadcast should match this name.
         self._login_user = name
 
-        crc = get_string_crc(password)
+        crc = get_string_crc_signed(password)
         ow = 1 if overwrite else 0
 
         def _f(x: float) -> str:

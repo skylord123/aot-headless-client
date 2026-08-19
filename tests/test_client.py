@@ -9,7 +9,7 @@ import pytest
 from aotbot.bitstream import BitStream
 from aotbot.client import AotClient, parse_chat_line
 from aotbot.config import Config
-from aotbot.crc import get_string_crc
+from aotbot.crc import get_string_crc_signed
 from aotbot.events import EventManager
 
 
@@ -263,7 +263,7 @@ def test_login_sends_crc_hash():
     client.login()
     assert sent[0][0] == "login"
     assert sent[0][1][0] == "bot"
-    assert sent[0][1][1] == get_string_crc("hunter2")
+    assert sent[0][1][1] == get_string_crc_signed("hunter2")
 
 
 def test_say_and_global_use_correct_verbs():

@@ -116,6 +116,18 @@ def get_string_crc(s: str) -> int:
     return (crc ^ FINAL_XOR) & 0xFFFFFFFF
 
 
+def get_string_crc_signed(s: str) -> int:
+    """``getStringCRC`` as TorqueScript renders it: a signed S32.
+
+    The console function returns an S32, so values with the top bit set print
+    with a minus sign. The server string-compares the login CRC against that
+    rendering, so the wire argument must use this signed form, not the
+    unsigned one.
+    """
+    crc = get_string_crc(s)
+    return crc - 0x100000000 if crc >= 0x80000000 else crc
+
+
 if __name__ == "__main__":
     import sys
     arg = sys.argv[1] if len(sys.argv) > 1 else ""

@@ -17,7 +17,12 @@ import zlib
 
 import pytest
 
-from aotbot.crc import get_string_crc, calculate_crc, INITIAL_CRC_VALUE
+from aotbot.crc import (
+    get_string_crc,
+    get_string_crc_signed,
+    calculate_crc,
+    INITIAL_CRC_VALUE,
+)
 
 
 # --- Mathematically certain vectors (== zlib.crc32) -------------------------
@@ -48,6 +53,22 @@ def test_result_is_unsigned_32bit():
     for text, _ in CERTAIN_VECTORS:
         v = get_string_crc(text)
         assert 0 <= v <= 0xFFFFFFFF
+
+
+def test_signed_form_matches_torque_s32_rendering():
+    # commandToServer('login', ...) must carry the CRC the way TorqueScript
+    # prints it: as a signed S32. The server string-compares that rendering,
+    # so any password whose CRC has the top bit set would fail with the
+    # unsigned form.
+    for text, _ in CERTAIN_VECTORS:
+        u = get_string_crc(text)
+        s = get_string_crc_signed(text)
+        assert s & 0xFFFFFFFF == u
+        assert -0x80000000 <= s <= 0x7FFFFFFF
+        if u >= 0x80000000:
+            assert s == u - 0x100000000
+        else:
+            assert s == u
 
 
 def test_calculate_crc_is_not_inverted():
